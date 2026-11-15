@@ -4,13 +4,14 @@
 
 | Version | Supported |
 |---------|-----------|
-| 4.0.x   | Yes       |
-| < 4.0   | No        |
+| 5.0.x   | Yes       |
+| < 5.0   | No        |
 
-3.x depends on `winrm-rs` 1.x, which `winrm-rs` no longer supports, so a
-fix in the WinRM layer only reaches 4.0.x; upgrade rather than wait for a
-3.x release. 2.0.x also ignores some `known_hosts` revocations (see the
-3.0.0 entry of `CHANGELOG.md`).
+4.x depends on `winrm-rs` 2.x, which `winrm-rs` no longer supports, so a
+fix in the WinRM layer only reaches 5.0.x; upgrade rather than wait for a
+4.x release. 4.0.x and earlier also set no bound on what a pool accepts
+from the server (see *Security* in the 5.0.0 entry of `CHANGELOG.md`), and
+2.0.x ignores some `known_hosts` revocations (see the 3.0.0 entry).
 
 ## Reporting a Vulnerability
 

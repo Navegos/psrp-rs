@@ -2,5 +2,5 @@
 # cargo-vet imports lock
 
 [[unpublished.psrp-rs]]
-version = "4.0.0"
-audited_as = "3.1.0"
+version = "5.0.0"
+audited_as = "4.0.0"
