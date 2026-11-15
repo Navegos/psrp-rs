@@ -5,8 +5,10 @@
 //! accepted transparently.
 
 use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasher, RandomState};
 
 use quick_xml::Reader;
+use quick_xml::events::attributes::Attribute;
 use quick_xml::events::{BytesStart, Event};
 
 use super::{PsObject, PsValue};
@@ -18,16 +20,98 @@ use crate::error::{PsrpError, Result};
 /// message, for example, is one `<Obj>` at the top level — but a
 /// `SessionCapability` message consists of an `<Obj>` with a `<MS>` of
 /// primitive siblings, which this parser also handles).
+///
+/// # Limits
+///
+/// The document usually comes from a remote host, so what it may cost is
+/// bounded, and passing a bound is a [`PsrpError::Clixml`]:
+///
+/// - nesting: [`MAX_NESTING_DEPTH`] levels;
+/// - `<Ref>` and `<TNRef>` copies: in proportion to the length of the
+///   document;
+/// - memory: the values of one document may take
+///   [`DEFAULT_MAX_DECODED_SIZE`] bytes. Decoding amplifies (a `<Nil/>` is
+///   six bytes of XML and one [`PsValue`] in memory, some twenty times
+///   more), so the length of the document bounds nothing: the decoder counts
+///   what it builds, every value at its size in memory plus its text or
+///   bytes, every property and type name, every copy a reference makes. The
+///   count is an estimate (it ignores the spare capacity of collections),
+///   charged as the document is read, so decoding stops at the limit, not
+///   after the values have been built.
+///
+/// A [`RunspacePool`](crate::RunspacePool) applies the last one to each
+/// pipeline as a whole, see [`ReceiveLimits`](crate::ReceiveLimits).
 pub fn parse_clixml(xml: &str) -> Result<Vec<PsValue>> {
+    parse_clixml_within(xml, &mut DecodeBudget::default())
+}
+
+/// Most memory the values decoded from one document, or by one pipeline, may
+/// take by default: 1 GiB. [`parse_clixml`] says how it is counted.
+pub const DEFAULT_MAX_DECODED_SIZE: usize = 1 << 30;
+
+/// A cap on the memory taken by the values decoded against it, shared by the
+/// documents of one pipeline. [`parse_clixml`] says what is counted.
+#[derive(Debug, Clone)]
+pub(crate) struct DecodeBudget {
+    limit: u64,
+    used: u64,
+}
+
+impl Default for DecodeBudget {
+    /// [`DEFAULT_MAX_DECODED_SIZE`], none of it used.
+    fn default() -> Self {
+        Self::new(DEFAULT_MAX_DECODED_SIZE)
+    }
+}
+
+impl DecodeBudget {
+    pub(crate) fn new(limit: usize) -> Self {
+        Self {
+            limit: weight_of_len(limit),
+            used: 0,
+        }
+    }
+
+    /// A budget with the same limit and nothing used.
+    fn unused(&self) -> Self {
+        Self {
+            limit: self.limit,
+            used: 0,
+        }
+    }
+
+    /// What the documents decoded so far were charged.
+    #[cfg(test)]
+    pub(crate) fn used(&self) -> usize {
+        usize::try_from(self.used).unwrap_or(usize::MAX)
+    }
+}
+
+/// [`parse_clixml`] for a message that is read and dropped (a state, a host
+/// call, a session key): it is bounded by the limit of `budget` on its own,
+/// whatever is already used, and nothing is taken from it. Without this,
+/// such a message would be decoded against the default gibibyte whatever
+/// limit the caller had set; counted against what is left, the state that
+/// ends a pipeline would be refused when its output had filled the budget.
+pub(crate) fn parse_clixml_transient(xml: &str, budget: &DecodeBudget) -> Result<Vec<PsValue>> {
+    parse_clixml_within(xml, &mut budget.unused())
+}
+
+/// [`parse_clixml`] against a budget shared with other documents: what this
+/// one decodes to is taken from `budget`, and passing it is an error.
+pub(crate) fn parse_clixml_within(xml: &str, budget: &mut DecodeBudget) -> Result<Vec<PsValue>> {
     let cleaned = xml.trim_start_matches('\u{FEFF}').trim_start();
     let mut reader = Reader::from_str(cleaned);
     reader.config_mut().trim_text(false);
 
     let mut state = DecoderState {
-        referenced: referenced_ids(cleaned),
         budget: ref_budget(cleaned.len()),
+        names_budget: type_names_budget(cleaned.len()),
+        decoded: budget.used,
+        decoded_limit: budget.limit,
         ..DecoderState::default()
     };
+    state.note_referenced(cleaned)?;
     let mut out: Vec<PsValue> = Vec::new();
     let mut buf = Vec::new();
 
@@ -52,6 +136,8 @@ pub fn parse_clixml(xml: &str) -> Result<Vec<PsValue>> {
         buf.clear();
     }
 
+    // The copies kept for a later `<Ref>` are released with `state`.
+    budget.used = state.decoded.saturating_sub(state.kept);
     Ok(out)
 }
 
@@ -91,47 +177,77 @@ fn weight_of_len(len: usize) -> u64 {
 }
 
 fn ref_budget(xml_len: usize) -> u64 {
-    REF_BUDGET_FLOOR
-        .saturating_add(weight_of_len(xml_len).saturating_mul(REF_BUDGET_PER_BYTE))
-        .min(REF_BUDGET_CEILING)
+    type_names_budget(xml_len).min(REF_BUDGET_CEILING)
+}
+
+/// The weight (see [`type_names_weight`]) that the `<TNRef>`s of one document
+/// may copy: the floor and the allowance per byte of the references, without
+/// their ceiling.
+///
+/// PowerShell writes the type names of an object once and a `<TNRef>` in
+/// every later object of that type, so a document of small typed objects
+/// legitimately copies in proportion to its length, however long it is (a
+/// `<TNRef>` to four names weighs about a hundred, in an object of at least
+/// forty bytes). What is refused is the product: a long list stored once and
+/// named by thousands of empty objects. The absolute bound on what a document
+/// decodes to is [`DecodeBudget`], which these copies are charged to as well.
+fn type_names_budget(xml_len: usize) -> u64 {
+    REF_BUDGET_FLOOR.saturating_add(weight_of_len(xml_len).saturating_mul(REF_BUDGET_PER_BYTE))
 }
 
 /// The `RefId`s that some `<Ref>` of the document points to.
 ///
 /// Only those objects are kept for a later reference, so that an object
 /// nobody references is not cloned (once per enclosing object that has a
-/// `RefId`, which is all of them in PowerShell's output). A malformed
-/// document ends the scan early; the real parse reports the error.
-fn referenced_ids(xml: &str) -> HashSet<String> {
-    let mut reader = Reader::from_str(xml);
-    let mut ids = HashSet::new();
-    let mut buf = Vec::new();
-    while let Ok(event) = reader.read_event_into(&mut buf) {
-        match event {
-            Event::Start(e) | Event::Empty(e) if e.name().as_ref() == "Ref" => {
-                if let Ok(Some(id)) = ref_ref_id_attr(&e) {
-                    ids.insert(id);
-                }
-            }
-            Event::Eof => break,
-            _ => {}
-        }
-        buf.clear();
-    }
-    ids
+/// `RefId`, which is all of them in PowerShell's output).
+///
+/// A document may name millions of ids, each as long as the server likes,
+/// so the set holds a hash of each, not its text. The hash is keyed per
+/// document. Two ids with the same hash would only make the decoder keep
+/// (and charge) an object nobody references.
+#[derive(Default)]
+struct Referenced {
+    keys: RandomState,
+    ids: HashSet<u64>,
 }
+
+impl Referenced {
+    /// Note `id`; true when it was not there yet.
+    fn insert(&mut self, id: &str) -> bool {
+        self.ids.insert(self.keys.hash_one(id))
+    }
+
+    fn contains(&self, id: &str) -> bool {
+        self.ids.contains(&self.keys.hash_one(id))
+    }
+}
+
+/// What one id of [`Referenced`] is charged: its hash and its share of the
+/// table.
+const REFERENCED_ID_SIZE: u64 = 16;
 
 #[derive(Default)]
 struct DecoderState {
-    /// Objects that a `<Ref>` points to, by `RefId` (see [`referenced_ids`]).
+    /// Objects that a `<Ref>` points to, by `RefId` (see [`Referenced`]).
     refs: HashMap<String, PsValue>,
-    referenced: HashSet<String>,
+    referenced: Referenced,
     /// Weight materialized by references so far, bounded by `budget`.
     expanded: u64,
     budget: u64,
+    /// Type-name lists stored by a `<TN RefId>`, for the `<TNRef>`s.
     type_names: HashMap<String, Vec<String>>,
+    /// Weight copied by `<TNRef>`s so far, bounded by `names_budget`.
+    names_expanded: u64,
+    names_budget: u64,
     /// Current nesting level, maintained by [`parse_element`].
     depth: u32,
+    /// Estimated memory of everything decoded so far, bounded by
+    /// `decoded_limit` (see [`DecodeBudget`]).
+    decoded: u64,
+    decoded_limit: u64,
+    /// The part of `decoded` that lives only as long as this state: the
+    /// copies in `refs` and `type_names`.
+    kept: u64,
 }
 
 impl DecoderState {
@@ -147,6 +263,159 @@ impl DecoderState {
         self.expanded = expanded;
         Ok(())
     }
+
+    /// Charge `weight` to the `<TNRef>` budget, or fail when it is spent.
+    fn charge_names(&mut self, weight: u64) -> Result<()> {
+        let expanded = self.names_expanded.saturating_add(weight);
+        if expanded > self.names_budget {
+            return Err(PsrpError::clixml(format!(
+                "CLIXML <TNRef> expansion exceeds {}",
+                self.names_budget
+            )));
+        }
+        self.names_expanded = expanded;
+        Ok(())
+    }
+
+    /// Count `bytes` more of decoded values, or fail when that passes the
+    /// cap.
+    fn charge_size(&mut self, bytes: u64) -> Result<()> {
+        let decoded = self.decoded.saturating_add(bytes);
+        if decoded > self.decoded_limit {
+            return Err(PsrpError::clixml(format!(
+                "CLIXML decodes to more than the {}-byte limit",
+                self.decoded_limit
+            )));
+        }
+        self.decoded = decoded;
+        Ok(())
+    }
+
+    /// [`charge_size`](Self::charge_size) for a copy this state keeps for
+    /// itself (in `refs`, `type_names` or `referenced`): counted while the
+    /// document is decoded, given back to the caller's budget at the end.
+    fn charge_kept(&mut self, bytes: u64) -> Result<()> {
+        self.charge_size(bytes)?;
+        self.kept = self.kept.saturating_add(bytes);
+        Ok(())
+    }
+
+    /// Read the document once for the ids its `<Ref>`s point to (see
+    /// [`Referenced`]), each charged as it is noted: the set is built before
+    /// a single value is, from a document that may be nothing but `<Ref>`s.
+    /// A malformed document ends the scan early; the real parse reports the
+    /// error.
+    fn note_referenced(&mut self, xml: &str) -> Result<()> {
+        let mut reader = Reader::from_str(xml);
+        let mut buf = Vec::new();
+        while let Ok(event) = reader.read_event_into(&mut buf) {
+            match event {
+                Event::Start(e) | Event::Empty(e) if e.name().as_ref() == "Ref" => {
+                    if let Ok(Some(id)) = ref_ref_id_attr(&e)
+                        && self.referenced.insert(&id)
+                    {
+                        self.charge_kept(REFERENCED_ID_SIZE)?;
+                    }
+                }
+                Event::Eof => break,
+                _ => {}
+            }
+            buf.clear();
+        }
+        Ok(())
+    }
+}
+
+/// What one [`PsValue`] takes inline, wherever it sits.
+fn node_size() -> u64 {
+    weight_of_len(std::mem::size_of::<PsValue>())
+}
+
+/// What a property costs besides its name and its value: the `String`
+/// header, the hash and the index of its map entry.
+const ENTRY_SIZE: u64 = 48;
+
+/// What `v` takes by itself: its node, and its text or bytes. The children
+/// of a container are not counted (they were when they were decoded).
+fn own_size(v: &PsValue) -> u64 {
+    let payload = match v {
+        PsValue::String(s)
+        | PsValue::Decimal(s)
+        | PsValue::DateTime(s)
+        | PsValue::Duration(s)
+        | PsValue::Version(s)
+        | PsValue::Uri(s)
+        | PsValue::Xml(s)
+        | PsValue::ScriptBlock(s)
+        | PsValue::SecureString(s) => s.len(),
+        PsValue::Bytes(b) => b.len(),
+        PsValue::Object(o) => o.to_string.as_ref().map_or(0, String::len),
+        _ => 0,
+    };
+    node_size().saturating_add(weight_of_len(payload))
+}
+
+/// What a property named `name` costs, its value aside.
+fn entry_size(name: &str) -> u64 {
+    ENTRY_SIZE.saturating_add(weight_of_len(name.len()))
+}
+
+/// What a list of type names costs: each one's text and `String` header.
+fn type_names_size(names: &[String]) -> u64 {
+    let header = weight_of_len(std::mem::size_of::<String>());
+    names.iter().fold(0, |size: u64, name| {
+        size.saturating_add(header)
+            .saturating_add(weight_of_len(name.len()))
+    })
+}
+
+/// What `v` takes with everything under it: the cost of a copy.
+fn deep_size(v: &PsValue) -> u64 {
+    let children = match v {
+        PsValue::List(items) => items
+            .iter()
+            .fold(0, |size: u64, item| size.saturating_add(deep_size(item))),
+        PsValue::Dict(entries) => entries.iter().fold(0, |size: u64, (key, value)| {
+            size.saturating_add(deep_size(key))
+                .saturating_add(deep_size(value))
+        }),
+        PsValue::Object(o) => {
+            o.properties
+                .iter()
+                .fold(type_names_size(&o.type_names), |size, (name, value)| {
+                    size.saturating_add(entry_size(name))
+                        .saturating_add(deep_size(value))
+                })
+        }
+        _ => 0,
+    };
+    own_size(v).saturating_add(children)
+}
+
+/// The weight of a list of type names, as [`measure`] counts it in an object:
+/// one per name, plus its length.
+fn type_names_weight(names: &[String]) -> u64 {
+    names.iter().fold(0, |weight: u64, name| {
+        weight
+            .saturating_add(weight_of_len(name.len()))
+            .saturating_add(1)
+    })
+}
+
+/// The attributes of `e` that parse, in order, duplicates included.
+///
+/// quick-xml checks each attribute name against the earlier ones of its tag
+/// unless told not to. Past 32 attributes it hashes the names, but a name it
+/// has seen still costs a scan of all the earlier ones, and the iteration
+/// goes on after the error: a tag of n different attributes followed by m
+/// copies of the last cost n × m comparisons, hours of CPU for 20 MB of
+/// attributes, inside one call that nothing can interrupt. Nothing here
+/// needs the check: each reader takes the first attribute of the name it
+/// wants, as it did when the copies were reported as errors and skipped.
+fn attributes<'a>(e: &'a BytesStart<'_>) -> impl Iterator<Item = Attribute<'a>> {
+    let mut attributes = e.attributes();
+    attributes.with_checks(false);
+    attributes.flatten()
 }
 
 /// Read the `N="…"` property-name attribute.
@@ -158,7 +427,7 @@ impl DecoderState {
 /// re-encoder escapes the result again, the damage compounds on every
 /// hop (`&lt;` becomes `&amp;lt;` becomes `&amp;amp;lt;` …).
 fn name_attr(e: &BytesStart) -> Result<Option<String>> {
-    for attr in e.attributes().flatten() {
+    for attr in attributes(e) {
         if attr.key.as_ref() == "N" {
             let unescaped = attr
                 .normalized_value(quick_xml::XmlVersion::Implicit1_0)
@@ -171,7 +440,7 @@ fn name_attr(e: &BytesStart) -> Result<Option<String>> {
 
 /// Read the `RefId="…"` attribute of an `<Obj>` / `<TN>`.
 fn ref_id_attr(e: &BytesStart) -> Result<Option<String>> {
-    for attr in e.attributes().flatten() {
+    for attr in attributes(e) {
         if attr.key.as_ref() == "RefId" {
             let unescaped = attr
                 .normalized_value(quick_xml::XmlVersion::Implicit1_0)
@@ -202,18 +471,28 @@ fn ref_ref_id_attr(e: &BytesStart) -> Result<Option<String>> {
 /// otherwise build a value deep enough to overflow the stack of whatever
 /// walks it next).
 fn resolve_ref(e: &BytesStart, state: &mut DecoderState, level: u32) -> Result<PsValue> {
-    let Some(target) = ref_ref_id_attr(e)?.and_then(|r| state.refs.get(&r)) else {
+    let Some(id) = ref_ref_id_attr(e)? else {
+        state.charge_size(node_size())?;
         return Ok(PsValue::Null);
     };
-    let (weight, height) = measure(target);
+    let Some(((weight, height), size)) = state
+        .refs
+        .get(&id)
+        .map(|target| (measure(target), deep_size(target)))
+    else {
+        state.charge_size(node_size())?;
+        return Ok(PsValue::Null);
+    };
     if state.depth.saturating_add(level).saturating_add(height) > MAX_NESTING_DEPTH {
         return Err(PsrpError::clixml(format!(
             "CLIXML <Ref> would nest deeper than {MAX_NESTING_DEPTH} levels"
         )));
     }
-    let value = target.clone();
+    // Charged before the copy is made: a copy that passes a budget is
+    // refused without having been built.
     state.charge(weight)?;
-    Ok(value)
+    state.charge_size(size)?;
+    Ok(state.refs.get(&id).cloned().unwrap_or(PsValue::Null))
 }
 
 /// Rough memory weight and container nesting of a decoded value.
@@ -272,18 +551,76 @@ fn measure(v: &PsValue) -> (u64, u32) {
 }
 
 fn parse_empty(e: &BytesStart, state: &mut DecoderState) -> Result<Option<PsValue>> {
-    match e.name().as_ref() {
-        "Nil" => Ok(Some(PsValue::Null)),
-        "Ref" => resolve_ref(e, state, 1).map(Some),
-        "S" => Ok(Some(PsValue::String(String::new()))),
+    let value = match e.name().as_ref() {
+        "Nil" => PsValue::Null,
+        // Charged whole by `resolve_ref`.
+        "Ref" => return resolve_ref(e, state, 1).map(Some),
+        "S" => PsValue::String(String::new()),
         // PowerShell normally writes an empty value self-closed
         // (`<S N="x" />`, `<SBK N="x" />`: the .NET writer shortens an element
         // with no content), and `<S></S>` only when its output buffer happens
         // to flush before the end tag; both must decode.
-        "SBK" | "SCT" => Ok(Some(PsValue::ScriptBlock(String::new()))),
-        "ToString" => Ok(None),
-        _ => Ok(None),
+        "SBK" | "SCT" => PsValue::ScriptBlock(String::new()),
+        // `<ToString />` and anything unknown.
+        _ => return Ok(None),
+    };
+    // Six bytes of XML are one value in memory: this is where a document of
+    // `<Nil/>` is stopped.
+    state.charge_size(node_size())?;
+    Ok(Some(value))
+}
+
+/// The value of a dictionary slot, `Null` when the entry had none; that
+/// `Null` is a value like the others and is charged as one.
+fn or_null(slot: Option<PsValue>, state: &mut DecoderState) -> Result<PsValue> {
+    if let Some(value) = slot {
+        return Ok(value);
     }
+    state.charge_size(node_size())?;
+    Ok(PsValue::Null)
+}
+
+/// Add a property to `obj`, charging what its entry costs besides the value
+/// (already charged when it was decoded).
+fn insert_property(
+    obj: &mut PsObject,
+    name: String,
+    value: PsValue,
+    state: &mut DecoderState,
+) -> Result<()> {
+    state.charge_size(entry_size(&name))?;
+    obj.properties.insert(name, value);
+    Ok(())
+}
+
+/// Give `obj` the type names stored under `rid` by an earlier `<TN>`.
+///
+/// The list is copied into every object that names it, so the copy is
+/// charged (see [`type_names_budget`]), and before it is made: a long list
+/// stored once and named by thousands of empty objects used to cost the
+/// product of the two, with nothing counted (45 KiB of XML for two million
+/// strings).
+fn apply_type_names_ref(
+    obj: &mut PsObject,
+    rid: Option<String>,
+    state: &mut DecoderState,
+) -> Result<()> {
+    let Some(rid) = rid else {
+        return Ok(());
+    };
+    let Some((weight, size)) = state
+        .type_names
+        .get(&rid)
+        .map(|names| (type_names_weight(names), type_names_size(names)))
+    else {
+        return Ok(());
+    };
+    state.charge_names(weight)?;
+    state.charge_size(size)?;
+    if let Some(names) = state.type_names.get(&rid) {
+        obj.type_names.clone_from(names);
+    }
+    Ok(())
 }
 
 fn parse_int<T>(reader: &mut Reader<&[u8]>, closing: &str) -> Result<T>
@@ -327,7 +664,16 @@ fn parse_element(
     state.depth = state.depth.saturating_add(1);
     let result = parse_element_inner(reader, e, state);
     state.depth = state.depth.saturating_sub(1);
-    result
+    let value = result?;
+    // Every value is charged here, by itself: what a container holds was
+    // charged as it was decoded. A `<Ref>` is the exception, `resolve_ref`
+    // charged its whole copy.
+    if let Some(value) = &value
+        && e.name().as_ref() != "Ref"
+    {
+        state.charge_size(own_size(value))?;
+    }
+    Ok(value)
 }
 
 fn parse_element_inner(
@@ -460,8 +806,10 @@ fn parse_element_inner(
             let obj = parse_obj_body(reader, state)?;
             let value = PsValue::Object(obj);
             if let Some(rid) = ref_id.filter(|r| state.referenced.contains(r)) {
-                // A kept copy is memory too: it is charged like the others.
+                // A kept copy is memory too: it is charged like the others,
+                // with the id it is kept under.
                 state.charge(measure(&value).0)?;
+                state.charge_kept(deep_size(&value).saturating_add(entry_size(&rid)))?;
                 state.refs.insert(rid, value.clone());
             }
             // Flatten: if the object has no properties and no type names
@@ -499,7 +847,10 @@ fn parse_obj_body(reader: &mut Reader<&[u8]>, state: &mut DecoderState) -> Resul
                 "TN" => {
                     let rid = ref_id_attr(&e)?;
                     let names = parse_type_names(reader)?;
-                    if let Some(rid) = rid.clone() {
+                    let size = type_names_size(&names);
+                    state.charge_size(size)?;
+                    if let Some(rid) = rid {
+                        state.charge_kept(size.saturating_add(entry_size(&rid)))?;
                         state.type_names.insert(rid, names.clone());
                     }
                     obj.type_names = names;
@@ -507,18 +858,16 @@ fn parse_obj_body(reader: &mut Reader<&[u8]>, state: &mut DecoderState) -> Resul
                 "TNRef" => {
                     let rid = ref_ref_id_attr(&e)?;
                     skip_to_end(reader)?;
-                    if let Some(rid) = rid
-                        && let Some(names) = state.type_names.get(&rid)
-                    {
-                        obj.type_names.clone_from(names);
-                    }
+                    apply_type_names_ref(&mut obj, rid, state)?;
                 }
                 "LST" | "IE" | "QUE" | "STK" => {
                     let items = parse_list(reader, state, e.name().as_ref().to_string())?;
+                    state.charge_size(node_size())?;
                     embedded = Some(PsValue::List(items));
                 }
                 "DCT" => {
                     let entries = parse_dict(reader, state)?;
+                    state.charge_size(node_size())?;
                     embedded = Some(PsValue::Dict(entries));
                 }
                 // A nameless scalar child: the number of a .NET enum
@@ -533,11 +882,7 @@ fn parse_obj_body(reader: &mut Reader<&[u8]>, state: &mut DecoderState) -> Resul
             Event::Empty(e) => match e.name().as_ref() {
                 "TNRef" => {
                     let rid = ref_ref_id_attr(&e)?;
-                    if let Some(rid) = rid
-                        && let Some(names) = state.type_names.get(&rid)
-                    {
-                        obj.type_names.clone_from(names);
-                    }
+                    apply_type_names_ref(&mut obj, rid, state)?;
                 }
                 "ToString" | "Nil" => {}
                 _ => {}
@@ -557,7 +902,7 @@ fn parse_obj_body(reader: &mut Reader<&[u8]>, state: &mut DecoderState) -> Resul
     if let Some(v) = embedded
         && obj.properties.is_empty()
     {
-        obj.properties.insert("_value".into(), v);
+        insert_property(&mut obj, "_value".into(), v, state)?;
     }
 
     Ok(obj)
@@ -578,18 +923,20 @@ fn parse_member_set(
             Event::Start(e) => {
                 let name = name_attr(&e)?.unwrap_or_default();
                 if let Some(v) = parse_element(reader, &e, state)? {
-                    obj.properties.insert(name, v);
+                    insert_property(obj, name, v, state)?;
                 }
             }
             Event::Empty(e) => match e.name().as_ref() {
                 "Nil" => {
                     if let Some(name) = name_attr(&e)? {
-                        obj.properties.insert(name, PsValue::Null);
+                        state.charge_size(node_size())?;
+                        insert_property(obj, name, PsValue::Null, state)?;
                     }
                 }
                 _ => {
                     if let Some(v) = parse_empty(&e, state)? {
-                        obj.properties.insert(name_attr(&e)?.unwrap_or_default(), v);
+                        let name = name_attr(&e)?.unwrap_or_default();
+                        insert_property(obj, name, v, state)?;
                     }
                 }
             },
@@ -661,8 +1008,8 @@ fn parse_dict_entry(
     reader: &mut Reader<&[u8]>,
     state: &mut DecoderState,
 ) -> Result<(PsValue, PsValue)> {
-    let mut key = PsValue::Null;
-    let mut val = PsValue::Null;
+    let mut key = None;
+    let mut val = None;
     let mut buf = Vec::new();
     loop {
         match reader
@@ -673,8 +1020,8 @@ fn parse_dict_entry(
                 let name = name_attr(&e)?.unwrap_or_default();
                 if let Some(v) = parse_element(reader, &e, state)? {
                     match name.as_str() {
-                        "Key" => key = v,
-                        "Value" => val = v,
+                        "Key" => key = Some(v),
+                        "Value" => val = Some(v),
                         _ => {}
                     }
                 }
@@ -682,8 +1029,8 @@ fn parse_dict_entry(
             Event::Empty(e) => {
                 if let Some(v) = parse_empty(&e, state)? {
                     match name_attr(&e)?.unwrap_or_default().as_str() {
-                        "Key" => key = v,
-                        "Value" => val = v,
+                        "Key" => key = Some(v),
+                        "Value" => val = Some(v),
                         _ => {}
                     }
                 }
@@ -694,7 +1041,8 @@ fn parse_dict_entry(
         }
         buf.clear();
     }
-    Ok((key, val))
+    // An `<En></En>` is nine bytes of XML and two values in memory.
+    Ok((or_null(key, state)?, or_null(val, state)?))
 }
 
 fn parse_type_names(reader: &mut Reader<&[u8]>) -> Result<Vec<String>> {
@@ -1989,5 +2337,386 @@ mod tests {
         };
         assert_eq!(o.get("a"), Some(&PsValue::String("x".into())));
         assert!(o.get("_value").is_none());
+    }
+
+    // ---------- <TNRef> copies and the decoded-size budget ----------
+
+    /// Decode against a budget of `limit` bytes; what was used comes back too.
+    fn within(xml: &str, limit: u64) -> (Result<Vec<PsValue>>, u64) {
+        let mut budget = DecodeBudget::new(usize::try_from(limit).unwrap());
+        let got = parse_clixml_within(xml, &mut budget);
+        (got, budget.used)
+    }
+
+    /// What one value takes inline.
+    fn node() -> u64 {
+        u64::try_from(std::mem::size_of::<PsValue>()).unwrap()
+    }
+
+    /// Regression: a `<TNRef>` copied the stored list into the object with
+    /// nothing counted, so 1 000 names stored once and named by 2 000 empty
+    /// objects were two million strings for 45 KiB of XML (+107 MiB, and
+    /// four times that for twice the document). Both spellings of the
+    /// element are charged.
+    #[test]
+    fn type_name_refs_cannot_multiply_a_long_list() {
+        for reference in [r#"<TNRef RefId="0" />"#, r#"<TNRef RefId="0"></TNRef>"#] {
+            let mut xml = String::from(r#"<Obj RefId="0"><TN RefId="0">"#);
+            for _ in 0..1000 {
+                xml.push_str("<T>a</T>");
+            }
+            xml.push_str("</TN></Obj>");
+            for _ in 0..2000 {
+                xml.push_str("<Obj>");
+                xml.push_str(reference);
+                xml.push_str("</Obj>");
+            }
+            let err = parse_clixml(&xml).expect_err("two million strings must not decode");
+            assert!(err.to_string().contains("<TNRef> expansion"), "{err}");
+        }
+    }
+
+    /// What PowerShell does write is not limited, however long the document:
+    /// one `<TNRef>` per object of a type. 100 000 of them weigh more than
+    /// the ceiling of the `<Ref>` budget, which does not apply to them.
+    #[test]
+    fn a_type_name_ref_per_object_is_not_limited() {
+        let names = [
+            "System.IO.FileInfo",
+            "System.IO.FileSystemInfo",
+            "System.MarshalByRefObject",
+            "System.Object",
+        ];
+        let mut xml = String::from(r#"<Obj RefId="0"><TN RefId="0">"#);
+        for name in names {
+            xml.push_str(&format!("<T>{name}</T>"));
+        }
+        xml.push_str("</TN><LST>");
+        for _ in 0..100_000 {
+            xml.push_str(r#"<Obj><TNRef RefId="0" /></Obj>"#);
+        }
+        xml.push_str("</LST></Obj>");
+        let weight = type_names_weight(&names.map(String::from));
+        assert!(weight * 100_000 > REF_BUDGET_CEILING);
+
+        let got = parse_clixml(&xml).unwrap();
+        let Some(PsValue::List(items)) = got[0].properties().and_then(|o| o.get("_value")) else {
+            panic!("expected the list");
+        };
+        assert_eq!(items.len(), 100_000);
+        assert_eq!(items[99_999].type_names().unwrap(), names);
+    }
+
+    /// The budgets of the two kinds of reference: same floor and allowance,
+    /// a ceiling for `<Ref>` only.
+    #[test]
+    fn reference_budgets() {
+        assert_eq!(ref_budget(0), 1 << 20);
+        assert_eq!(type_names_budget(0), 1 << 20);
+        assert_eq!(ref_budget(1000), (1 << 20) + 8000);
+        assert_eq!(type_names_budget(1000), (1 << 20) + 8000);
+        assert_eq!(ref_budget(100 << 20), 8 << 20);
+        assert_eq!(type_names_budget(100 << 20), (1 << 20) + (800 << 20));
+        assert_eq!(type_names_budget(usize::MAX), u64::MAX);
+    }
+
+    /// The copy of a `<TNRef>` is charged at its weight: one per name plus
+    /// its length.
+    #[test]
+    fn a_type_name_ref_is_charged_at_its_weight() {
+        let names = vec!["ab".to_string(), String::new(), "c".to_string()];
+        assert_eq!(type_names_weight(&names), 3 + 3);
+        assert_eq!(type_names_weight(&[]), 0);
+
+        let mut state = DecoderState {
+            names_budget: 12,
+            decoded_limit: u64::MAX,
+            ..DecoderState::default()
+        };
+        state.type_names.insert("7".into(), names.clone());
+        let mut obj = PsObject::new();
+        apply_type_names_ref(&mut obj, Some("7".into()), &mut state).unwrap();
+        assert_eq!(obj.type_names, names);
+        assert_eq!(state.names_expanded, 6);
+        assert_eq!(state.decoded, type_names_size(&names));
+        // A second copy fits exactly, a third does not, and is not made.
+        apply_type_names_ref(&mut obj, Some("7".into()), &mut state).unwrap();
+        assert_eq!(state.names_expanded, 12);
+        let mut other = PsObject::new();
+        let err = apply_type_names_ref(&mut other, Some("7".into()), &mut state).unwrap_err();
+        assert!(err.to_string().contains("exceeds 12"), "{err}");
+        assert_eq!(other.type_names, Vec::<String>::new());
+        assert_eq!(state.names_expanded, 12);
+        // No id, or an unknown one: nothing copied, nothing charged.
+        apply_type_names_ref(&mut other, None, &mut state).unwrap();
+        apply_type_names_ref(&mut other, Some("8".into()), &mut state).unwrap();
+        assert_eq!(other.type_names, Vec::<String>::new());
+        assert_eq!(state.names_expanded, 12);
+    }
+
+    /// A list of type names costs each name's text and `String` header.
+    #[test]
+    fn type_names_size_counts_text_and_headers() {
+        let header = u64::try_from(std::mem::size_of::<String>()).unwrap();
+        let names = vec!["ab".to_string(), "c".to_string()];
+        assert_eq!(type_names_size(&names), 2 * header + 3);
+        assert_eq!(type_names_size(&[]), 0);
+    }
+
+    /// Regression: six bytes of `<Nil/>` are one value in memory, some twenty
+    /// times more, and nothing bounded what a document decodes to. Every
+    /// value is now counted as it is built, to the byte of this estimate.
+    #[test]
+    fn a_document_is_charged_for_every_value_it_builds() {
+        let mut xml = String::from(r#"<Obj RefId="0"><LST>"#);
+        for _ in 0..1000 {
+            xml.push_str("<Nil/>");
+        }
+        xml.push_str("</LST></Obj>");
+        // 1 000 items, the list, the object, and the `_value` entry.
+        let exact = 1002 * node() + ENTRY_SIZE + 6;
+
+        let (got, used) = within(&xml, exact);
+        assert_eq!(got.unwrap().len(), 1);
+        assert_eq!(used, exact);
+
+        let (got, used) = within(&xml, exact - 1);
+        let err = got.expect_err("one byte short");
+        assert!(matches!(err, PsrpError::Clixml(_)), "{err:?}");
+        assert!(
+            err.to_string()
+                .contains(&format!("more than the {}-byte limit", exact - 1)),
+            "{err}"
+        );
+        assert_eq!(used, 0, "a refused document is not charged to the caller");
+    }
+
+    /// One budget for several documents: the second one starts where the
+    /// first one stopped.
+    #[test]
+    fn a_budget_is_shared_between_documents() {
+        let xml = "<S>hello</S><Nil/>";
+        let cost = 2 * node() + 5;
+        let mut budget = DecodeBudget::new(usize::try_from(2 * cost + 1).unwrap());
+        parse_clixml_within(xml, &mut budget).unwrap();
+        assert_eq!(budget.used, cost);
+        parse_clixml_within(xml, &mut budget).unwrap();
+        assert_eq!(budget.used, 2 * cost);
+        let err = parse_clixml_within(xml, &mut budget).unwrap_err();
+        assert!(err.to_string().contains("limit"), "{err}");
+        assert_eq!(budget.used, 2 * cost);
+    }
+
+    /// Text and bytes count for their length, names for theirs.
+    #[test]
+    fn payloads_and_names_are_counted() {
+        let scalar = |xml: &str| within(xml, u64::MAX).1 - node();
+        assert_eq!(scalar("<S>hello</S>"), 5);
+        assert_eq!(scalar("<S/>"), 0);
+        assert_eq!(scalar("<BA>AAAA</BA>"), 3);
+        assert_eq!(scalar("<I32>12345</I32>"), 0);
+        assert_eq!(scalar("<DT>2026-01-01</DT>"), 10);
+        assert_eq!(scalar("<SBK/>"), 0);
+
+        // An object, a three-letter property holding a two-letter string.
+        let (_, used) = within(r#"<Obj><MS><S N="abc">xy</S></MS></Obj>"#, u64::MAX);
+        assert_eq!(used, 2 * node() + 2 + ENTRY_SIZE + 3);
+        // The same with a null and with an empty string, self-closed.
+        for member in [r#"<Nil N="abc"/>"#, r#"<S N="abc"/>"#] {
+            let (_, used) = within(&format!("<Obj><MS>{member}</MS></Obj>"), u64::MAX);
+            assert_eq!(used, 2 * node() + ENTRY_SIZE + 3, "{member}");
+        }
+        // Type names: charged once for the object, and nothing stays charged
+        // for the copy kept under their `RefId`.
+        let names = type_names_size(&["ab".to_string()]);
+        for tn in ["<TN>", r#"<TN RefId="0">"#] {
+            let (_, used) = within(&format!("<Obj>{tn}<T>ab</T></TN></Obj>"), u64::MAX);
+            assert_eq!(used, node() + names, "{tn}");
+        }
+    }
+
+    /// An entry with no key or no value still holds two values.
+    #[test]
+    fn empty_dictionary_entries_are_charged() {
+        let dict = |entries: &str| {
+            let xml = format!("<Obj><DCT>{entries}</DCT></Obj>");
+            // The object, the dictionary and the `_value` entry aside.
+            within(&xml, u64::MAX).1 - 2 * node() - ENTRY_SIZE - 6
+        };
+        assert_eq!(dict(""), 0);
+        assert_eq!(dict("<En></En>"), 2 * node());
+        assert_eq!(dict(r#"<En><S N="Key">k</S></En>"#), 2 * node() + 1);
+        assert_eq!(dict(r#"<En><Nil N="Value"/></En>"#), 2 * node());
+        assert_eq!(
+            dict(r#"<En><S N="Key">k</S><I32 N="Value">1</I32></En>"#),
+            2 * node() + 1
+        );
+
+        let xml = format!("<Obj><DCT>{}</DCT></Obj>", "<En></En>".repeat(500));
+        let (got, _) = within(&xml, 999 * node());
+        assert!(got.unwrap_err().to_string().contains("limit"));
+    }
+
+    /// A `<Ref>` is charged for its whole copy, before the copy is made, and
+    /// the copy kept for it counts while the document is decoded only.
+    #[test]
+    fn references_are_charged_for_the_whole_copy() {
+        let xml = r#"<Obj RefId="s"><MS><S N="a">x</S></MS></Obj><Ref RefId="s"/>"#;
+        let object = 2 * node() + 1 + ENTRY_SIZE + 1;
+
+        let (got, used) = within(xml, u64::MAX);
+        assert_eq!(got.unwrap().len(), 2);
+        assert_eq!(used, 2 * object, "the object and its copy");
+
+        // While decoding, the kept copy is a third one, with the id it is
+        // kept under and the note that a `<Ref>` points to that id.
+        let decoding = 3 * object + (ENTRY_SIZE + 1) + REFERENCED_ID_SIZE;
+        assert!(within(xml, decoding).0.is_ok());
+        let (got, _) = within(xml, decoding - 1);
+        assert!(got.unwrap_err().to_string().contains("limit"));
+
+        // Dangling references are one `Null` each.
+        let (got, used) = within(r#"<Ref RefId="none"/><Ref/>"#, u64::MAX);
+        assert_eq!(got.unwrap(), vec![PsValue::Null, PsValue::Null]);
+        assert_eq!(used, 2 * node());
+        // Same for the spelling with an end tag.
+        let (_, used) = within(r#"<Ref RefId="none"></Ref>"#, u64::MAX);
+        assert_eq!(used, node());
+    }
+
+    /// `deep_size` is what a clone allocates: every node, text, name and
+    /// type name under the value.
+    #[test]
+    fn deep_size_walks_the_whole_value() {
+        let mut inner = PsObject::new().with("ab", PsValue::String("xyz".into()));
+        inner.type_names = vec!["T".into()];
+        inner.to_string = Some("shown".into());
+        let inner_size = 2 * node() + 3 + (ENTRY_SIZE + 2) + type_names_size(&inner.type_names) + 5;
+        assert_eq!(deep_size(&PsValue::Object(inner.clone())), inner_size);
+
+        let list = PsValue::List(vec![PsValue::Object(inner.clone()), PsValue::I32(1)]);
+        assert_eq!(deep_size(&list), 2 * node() + inner_size);
+
+        let dict = PsValue::Dict(vec![(PsValue::String("k".into()), PsValue::Object(inner))]);
+        assert_eq!(deep_size(&dict), 2 * node() + 1 + inner_size);
+        assert_eq!(deep_size(&PsValue::Bytes(vec![0; 9])), node() + 9);
+        assert_eq!(deep_size(&PsValue::Null), node());
+    }
+
+    /// The public entry point allows a gigabyte per document.
+    /// Regression: quick-xml checked every attribute name against the
+    /// earlier ones of its tag, and a name it had seen cost a scan of all of
+    /// them: 20 000 names followed by 20 000 copies of the last took
+    /// 4 × 10^8 comparisons (seconds here, hours for 20 MB of attributes),
+    /// inside a call nothing can interrupt.
+    #[test]
+    fn repeated_attributes_cost_no_more_than_the_others() {
+        use std::fmt::Write as _;
+        let mut doc = String::from("<Obj");
+        for i in 0..20_000 {
+            write!(doc, r#" a{i}="""#).unwrap();
+        }
+        for _ in 0..20_000 {
+            doc.push_str(r#" a19999="""#);
+        }
+        doc.push_str("><MS/></Obj>");
+        let started = std::time::Instant::now();
+        assert_eq!(parse_clixml(&doc).unwrap().len(), 1);
+        let took = started.elapsed();
+        assert!(took < std::time::Duration::from_secs(2), "{took:?}");
+    }
+
+    /// With copies of an attribute, the first one is read, as it was when
+    /// quick-xml reported the others as errors.
+    #[test]
+    fn the_first_attribute_of_a_name_is_the_one_read() {
+        let values = parse_clixml(concat!(
+            r#"<Obj RefId="0" RefId="9"><MS><S N="a" N="b">x</S></MS></Obj>"#,
+            r#"<Ref RefId="0"/><Ref RefId="9"/>"#,
+        ))
+        .unwrap();
+        assert_eq!(values.len(), 3);
+        let PsValue::Object(obj) = &values[0] else {
+            panic!("an object");
+        };
+        assert_eq!(obj.get("a"), Some(&PsValue::String("x".into())));
+        assert_eq!(obj.get("b"), None);
+        assert_eq!(values[1], values[0], "kept under its first id");
+        assert_eq!(values[2], PsValue::Null, "the second id names nothing");
+    }
+
+    /// Regression: the ids that `<Ref>`s point to were collected as text
+    /// before anything was charged, from a document that may be nothing but
+    /// `<Ref>`s: a 200 MiB message cost several times that, whatever
+    /// `max_pipeline_size` said. Each id is now a hash, charged as it is
+    /// noted and given back at the end.
+    #[test]
+    fn the_ids_references_point_to_are_charged() {
+        // A thousand references to objects that do not exist, in an element
+        // the decoder skips: no value is built.
+        use std::fmt::Write as _;
+        let mut doc = String::from("<X>");
+        for i in 0..1000 {
+            write!(doc, r#"<Ref RefId="{i}"/>"#).unwrap();
+        }
+        doc.push_str("</X>");
+        let (decoded, used) = within(&doc, 1000 * REFERENCED_ID_SIZE);
+        assert_eq!(decoded.unwrap().len(), 0);
+        assert_eq!(used, 0, "given back once the document is decoded");
+        let (decoded, _) = within(&doc, 1000 * REFERENCED_ID_SIZE - 1);
+        let err = decoded.unwrap_err();
+        assert!(err.to_string().contains("byte limit"), "{err}");
+
+        // The same id a thousand times is one id.
+        let same = format!("<X>{}</X>", r#"<Ref RefId="7"/>"#.repeat(1000));
+        assert!(within(&same, REFERENCED_ID_SIZE).0.is_ok());
+        assert!(within(&same, REFERENCED_ID_SIZE - 1).0.is_err());
+    }
+
+    /// The id a copy is kept under is as long as the server likes: it is
+    /// charged with the copy.
+    #[test]
+    fn the_id_a_copy_is_kept_under_is_charged() {
+        let id = "i".repeat(10_000);
+        let object = format!(r#"<Obj RefId="{id}"><MS/></Obj><Ref RefId="{id}"/>"#);
+        assert!(within(&object, 9_000).0.is_err());
+        let (decoded, used) = within(&object, 12_000);
+        assert_eq!(decoded.unwrap().len(), 2);
+        assert!(used < 1_000, "given back with the copy: {used}");
+
+        let names = format!(r#"<Obj RefId="0"><TN RefId="{id}"><T>A</T></TN><MS/></Obj>"#);
+        assert!(within(&names, 9_000).0.is_err());
+        let (decoded, used) = within(&names, 12_000);
+        assert_eq!(decoded.unwrap().len(), 1);
+        assert!(used < 1_000, "{used}");
+    }
+
+    /// A message that is read and dropped gets the whole limit, whatever
+    /// the budget has used, and leaves the budget as it was.
+    #[test]
+    fn a_transient_document_gets_the_whole_limit_and_takes_nothing() {
+        let doc = "<S>one</S><S>two</S><Nil/>";
+        let mut measure = DecodeBudget::new(usize::MAX);
+        parse_clixml_within(doc, &mut measure).unwrap();
+        let size = measure.used();
+        assert_eq!(size, 3 * std::mem::size_of::<PsValue>() + 6);
+        let mut budget = DecodeBudget::new(size);
+        parse_clixml_within(doc, &mut budget).unwrap();
+        assert_eq!(budget.used(), size, "full");
+        assert!(parse_clixml_within("<Nil/>", &mut budget.clone()).is_err());
+
+        assert_eq!(parse_clixml_transient(doc, &budget).unwrap().len(), 3);
+        assert_eq!(budget.used(), size, "nothing taken");
+        let tighter = DecodeBudget::new(size - 1);
+        let err = parse_clixml_transient(doc, &tighter).unwrap_err();
+        assert!(err.to_string().contains("byte limit"), "{err}");
+        assert_eq!(DecodeBudget::default().used(), 0);
+    }
+
+    #[test]
+    fn default_decoded_size_is_a_gibibyte() {
+        assert_eq!(DEFAULT_MAX_DECODED_SIZE, 1 << 30);
+        let budget = DecodeBudget::new(DEFAULT_MAX_DECODED_SIZE);
+        assert_eq!((budget.limit, budget.used), (1 << 30, 0));
     }
 }

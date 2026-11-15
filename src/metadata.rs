@@ -8,10 +8,11 @@
 
 use uuid::Uuid;
 
-use crate::clixml::{PsObject, PsValue, parse_clixml, to_clixml};
+use crate::clixml::decode::{DecodeBudget, parse_clixml_transient, parse_clixml_within};
+use crate::clixml::{PsObject, PsValue, to_clixml};
 use crate::error::{PsrpError, Result};
 use crate::message::MessageType;
-use crate::pipeline::PipelineState;
+use crate::pipeline::{PipelineState, stop_abandoned_pipeline};
 use crate::runspace::RunspacePool;
 use crate::transport::PsrpTransport;
 
@@ -130,52 +131,102 @@ impl<T: PsrpTransport> RunspacePool<T> {
     ///
     /// Sends a `GetCommandMetadata` message, drains the resulting
     /// pipeline, and returns a decoded [`CommandMetadata`] list.
+    ///
+    /// # Errors
+    ///
+    /// Only a pipeline that completed returns its list: one the server
+    /// reports `Failed` is a [`PsrpError::PipelineFailed`], `Stopped` a
+    /// [`PsrpError::Stopped`] and `Disconnected` a [`PsrpError::BadState`],
+    /// since a list cut short would pass for the whole of it. The read is
+    /// bounded by the pool's [`ReceiveLimits`](crate::ReceiveLimits) like a
+    /// pipeline's; a reply that passes them, or does not decode, ends the
+    /// call with that error after the server has been asked to stop.
     pub async fn get_command_metadata(
         &mut self,
         patterns: &[&str],
         command_type: CommandType,
     ) -> Result<Vec<CommandMetadata>> {
-        let pid = Uuid::new_v4();
+        self.get_command_metadata_as(Uuid::new_v4(), patterns, command_type)
+            .await
+    }
+
+    /// [`get_command_metadata`](Self::get_command_metadata) under a pipeline
+    /// id the caller chose (the tests have to know it to answer).
+    async fn get_command_metadata_as(
+        &mut self,
+        pid: Uuid,
+        patterns: &[&str],
+        command_type: CommandType,
+    ) -> Result<Vec<CommandMetadata>> {
+        let rpid = self.id();
         let body = build_get_command_metadata_body(patterns, command_type);
         self.send_pipeline_message(MessageType::GetCommandMetadata, pid, body)
             .await?;
 
+        let mut budget = DecodeBudget::new(self.receive_limits().max_pipeline_size());
         let mut out = Vec::new();
         loop {
-            let msg = self.next_message().await?;
+            let msg = match self.next_message().await {
+                Ok(msg) => msg,
+                Err(e) => {
+                    stop_abandoned_pipeline(self, false).await;
+                    return Err(e);
+                }
+            };
+            // Same rule as for a pipeline: what is addressed to another one
+            // (or carries a forged id) must not end up in this result, nor
+            // end it. This loop used to take every `PipelineOutput` and every
+            // `PipelineState` it read.
+            if msg.pid != pid || msg.rpid != rpid {
+                tracing::debug!(
+                    expected_pid = %pid,
+                    got_pid = %msg.pid,
+                    mt = ?msg.message_type,
+                    "dropping command-metadata message with mismatched pid/rpid",
+                );
+                continue;
+            }
             match msg.message_type {
                 MessageType::PipelineOutput => {
-                    for v in parse_clixml(&msg.data)? {
-                        if let Some(cm) = CommandMetadata::from_ps_object(&v) {
-                            out.push(cm);
+                    let values = match parse_clixml_within(&msg.data, &mut budget) {
+                        Ok(values) => values,
+                        Err(e) => {
+                            stop_abandoned_pipeline(self, false).await;
+                            return Err(e);
                         }
-                    }
+                    };
+                    out.extend(values.iter().filter_map(CommandMetadata::from_ps_object));
                 }
-                MessageType::PipelineState => {
-                    if let Some(state) = state_from_xml(&msg.data) {
-                        if state.is_terminal() {
-                            if state == PipelineState::Failed {
-                                return Err(PsrpError::PipelineFailed(
-                                    match crate::runspace::state::terminal_state_reason(&msg.data) {
-                                        Some(reason) => {
-                                            format!("GetCommandMetadata pipeline failed: {reason}")
-                                        }
-                                        None => "GetCommandMetadata pipeline failed".into(),
-                                    },
-                                ));
-                            }
-                            return Ok(out);
-                        }
+                MessageType::PipelineState => match state_from_xml(&msg.data, &budget) {
+                    Some(PipelineState::Failed) => {
+                        return Err(PsrpError::PipelineFailed(
+                            match crate::runspace::state::terminal_state_reason(&msg.data, &budget)
+                            {
+                                Some(reason) => {
+                                    format!("GetCommandMetadata pipeline failed: {reason}")
+                                }
+                                None => "GetCommandMetadata pipeline failed".into(),
+                            },
+                        ));
                     }
-                }
-                _ => continue,
+                    Some(PipelineState::Stopped) => return Err(PsrpError::Stopped),
+                    Some(PipelineState::Disconnected) => {
+                        return Err(PsrpError::BadState {
+                            expected: format!("{:?}", PipelineState::Completed),
+                            actual: format!("{:?}", PipelineState::Disconnected),
+                        });
+                    }
+                    Some(state) if state.is_terminal() => return Ok(out),
+                    _ => {}
+                },
+                _ => {}
             }
         }
     }
 }
 
-pub(crate) fn state_from_xml(xml: &str) -> Option<PipelineState> {
-    parse_clixml(xml).ok().and_then(|values| {
+pub(crate) fn state_from_xml(xml: &str, budget: &DecodeBudget) -> Option<PipelineState> {
+    parse_clixml_transient(xml, budget).ok().and_then(|values| {
         values.into_iter().find_map(|v| match v {
             PsValue::Object(obj) => obj
                 .get("PipelineState")
@@ -289,7 +340,8 @@ mod tests {
 
     #[test]
     fn state_from_xml_missing_is_none() {
-        assert!(state_from_xml("<Obj RefId=\"0\"><MS/></Obj>").is_none());
+        let budget = DecodeBudget::default();
+        assert!(state_from_xml("<Obj RefId=\"0\"><MS/></Obj>", &budget).is_none());
     }
 
     #[test]
@@ -297,7 +349,10 @@ mod tests {
         let xml = to_clixml(&PsValue::Object(
             PsObject::new().with("PipelineState", PsValue::I32(4)),
         ));
-        assert_eq!(state_from_xml(&xml), Some(PipelineState::Completed));
+        assert_eq!(
+            state_from_xml(&xml, &DecodeBudget::default()),
+            Some(PipelineState::Completed)
+        );
     }
 
     // ---------- Phase D: end-to-end tests ----------
@@ -338,49 +393,157 @@ mod tests {
         )
     }
 
+    /// `data` as a message of pipeline `pid` in pool `rpid`.
+    fn wire_for(mt: MessageType, data: String, rpid: Uuid, pid: Uuid) -> Vec<u8> {
+        PsrpMessage {
+            destination: Destination::Client,
+            message_type: mt,
+            rpid,
+            pid,
+            data,
+        }
+        .encode()
+    }
+
+    fn state_body(state: PipelineState) -> String {
+        to_clixml(&PsValue::Object(
+            PsObject::new().with("PipelineState", PsValue::I32(state as i32)),
+        ))
+    }
+
+    fn cmdlet(name: &str) -> String {
+        to_clixml(&PsValue::Object(
+            PsObject::new()
+                .with("Name", PsValue::String(name.into()))
+                .with("CommandType", PsValue::I32(8)),
+        ))
+    }
+
+    /// An opened pool, a pipeline id, and `messages` queued as the answer to
+    /// that pipeline.
+    async fn pool_answering(
+        t: &MockTransport,
+        messages: &[(MessageType, String)],
+    ) -> (crate::runspace::RunspacePool<MockTransport>, Uuid) {
+        t.push_incoming(encode_message(1, &opened_state()));
+        let pool = crate::runspace::RunspacePool::open_with_transport(t.clone())
+            .await
+            .unwrap();
+        let pid = Uuid::new_v4();
+        for (oid, (mt, data)) in (10u64..).zip(messages) {
+            let msg = wire_for(*mt, data.clone(), pool.id(), pid);
+            t.push_incoming(encode_message(oid, &msg));
+        }
+        (pool, pid)
+    }
+
     #[tokio::test]
     async fn get_command_metadata_returns_items() {
         let t = MockTransport::new();
-        t.push_incoming(encode_message(1, &opened_state()));
-
         // Two cmdlets emitted as PipelineOutput.
-        let cmd = |name: &str| {
-            to_clixml(&PsValue::Object(
-                PsObject::new()
-                    .with("Name", PsValue::String(name.into()))
-                    .with("CommandType", PsValue::I32(8)),
-            ))
-        };
-        t.push_incoming(encode_message(
-            10,
-            &wire_msg(MessageType::PipelineOutput, cmd("Get-Date")),
-        ));
-        t.push_incoming(encode_message(
-            11,
-            &wire_msg(MessageType::PipelineOutput, cmd("Get-Process")),
-        ));
-        t.push_incoming(encode_message(
-            12,
-            &pipeline_state(PipelineState::Completed),
-        ));
-
-        let mut pool = crate::runspace::RunspacePool::open_with_transport(t.clone())
-            .await
-            .unwrap();
+        let (mut pool, pid) = pool_answering(
+            &t,
+            &[
+                (MessageType::PipelineOutput, cmdlet("Get-Date")),
+                (MessageType::PipelineOutput, cmdlet("Get-Process")),
+                (
+                    MessageType::PipelineState,
+                    state_body(PipelineState::Completed),
+                ),
+            ],
+        )
+        .await;
         let cmds = pool
-            .get_command_metadata(&["Get-*"], CommandType::CMDLET)
+            .get_command_metadata_as(pid, &["Get-*"], CommandType::CMDLET)
             .await
             .unwrap();
         assert_eq!(cmds.len(), 2);
         assert_eq!(cmds[0].name, "Get-Date");
         assert_eq!(cmds[1].name, "Get-Process");
+        assert!(!*t.stopped.lock().unwrap());
+        let _ = pool.close().await;
+    }
+
+    /// Regression: the loop had no pipeline filter, so the output and the
+    /// terminal state of any other pipeline (or of a forged id) were taken
+    /// for the answer.
+    #[tokio::test]
+    async fn get_command_metadata_ignores_other_pipelines() {
+        let t = MockTransport::new();
+        let (mut pool, pid) = pool_answering(&t, &[]).await;
+        let rpid = pool.id();
+        let completed = state_body(PipelineState::Completed);
+        let queue = [
+            // Another pipeline of this pool, then the pool itself, then
+            // the right pipeline id under another pool's.
+            (
+                MessageType::PipelineOutput,
+                cmdlet("Forged-One"),
+                rpid,
+                Uuid::new_v4(),
+            ),
+            (
+                MessageType::PipelineOutput,
+                cmdlet("Forged-Two"),
+                rpid,
+                Uuid::nil(),
+            ),
+            (
+                MessageType::PipelineOutput,
+                cmdlet("Forged-Three"),
+                Uuid::new_v4(),
+                pid,
+            ),
+            (
+                MessageType::PipelineState,
+                completed.clone(),
+                rpid,
+                Uuid::new_v4(),
+            ),
+            (
+                MessageType::PipelineState,
+                completed.clone(),
+                Uuid::nil(),
+                Uuid::nil(),
+            ),
+            (MessageType::PipelineOutput, cmdlet("Get-Date"), rpid, pid),
+            (MessageType::PipelineState, completed, rpid, pid),
+        ];
+        for (oid, (mt, data, rpid, pid)) in (10u64..).zip(queue) {
+            t.push_incoming(encode_message(oid, &wire_for(mt, data, rpid, pid)));
+        }
+        let cmds = pool
+            .get_command_metadata_as(pid, &["Get-*"], CommandType::CMDLET)
+            .await
+            .unwrap();
+        let names: Vec<_> = cmds.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["Get-Date"]);
+        let _ = pool.close().await;
+    }
+
+    /// The public entry point picks a fresh pipeline id, so an answer on the
+    /// nil id is not its answer.
+    #[tokio::test]
+    async fn get_command_metadata_uses_its_own_pipeline_id() {
+        let t = MockTransport::new();
+        let (mut pool, _) = pool_answering(&t, &[]).await;
+        t.push_incoming(encode_message(
+            10,
+            &pipeline_state(PipelineState::Completed),
+        ));
+        let err = pool
+            .get_command_metadata(&["Get-*"], CommandType::CMDLET)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("mock inbox empty"), "{err}");
+        assert_eq!(t.pipeline_starts().len(), 1);
+        assert!(!t.pipeline_starts()[0].is_nil());
         let _ = pool.close().await;
     }
 
     #[tokio::test]
     async fn get_command_metadata_failure_carries_the_server_reason() {
         let t = MockTransport::new();
-        t.push_incoming(encode_message(1, &opened_state()));
         let exception = PsObject::new().with("Message", PsValue::String("no such module".into()));
         let record = PsObject::new().with("Exception", PsValue::Object(exception));
         let body = to_clixml(&PsValue::Object(
@@ -388,22 +551,9 @@ mod tests {
                 .with("PipelineState", PsValue::I32(PipelineState::Failed as i32))
                 .with("ExceptionAsErrorRecord", PsValue::Object(record)),
         ));
-        t.push_incoming(encode_message(
-            10,
-            &PsrpMessage {
-                destination: Destination::Client,
-                message_type: MessageType::PipelineState,
-                rpid: Uuid::nil(),
-                pid: Uuid::nil(),
-                data: body,
-            }
-            .encode(),
-        ));
-        let mut pool = crate::runspace::RunspacePool::open_with_transport(t)
-            .await
-            .unwrap();
+        let (mut pool, pid) = pool_answering(&t, &[(MessageType::PipelineState, body)]).await;
         let err = pool
-            .get_command_metadata(&["Nothing"], CommandType::ALL)
+            .get_command_metadata_as(pid, &["Nothing"], CommandType::ALL)
             .await
             .unwrap_err();
         assert!(
@@ -417,35 +567,133 @@ mod tests {
     #[tokio::test]
     async fn get_command_metadata_failed_pipeline_errors() {
         let t = MockTransport::new();
-        t.push_incoming(encode_message(1, &opened_state()));
-        t.push_incoming(encode_message(10, &pipeline_state(PipelineState::Failed)));
-        let mut pool = crate::runspace::RunspacePool::open_with_transport(t)
-            .await
-            .unwrap();
+        let (mut pool, pid) = pool_answering(
+            &t,
+            &[(
+                MessageType::PipelineState,
+                state_body(PipelineState::Failed),
+            )],
+        )
+        .await;
         let err = pool
-            .get_command_metadata(&["Nothing"], CommandType::ALL)
+            .get_command_metadata_as(pid, &["Nothing"], CommandType::ALL)
             .await
             .unwrap_err();
-        assert!(matches!(err, crate::error::PsrpError::PipelineFailed(_)));
+        assert!(
+            matches!(&err, crate::error::PsrpError::PipelineFailed(m)
+                if m == "GetCommandMetadata pipeline failed"),
+            "{err:?}"
+        );
+        let _ = pool.close().await;
+    }
+
+    /// A list cut short is not returned as if it were whole.
+    #[tokio::test]
+    async fn get_command_metadata_stopped_or_disconnected_is_an_error() {
+        for state in [PipelineState::Stopped, PipelineState::Disconnected] {
+            let t = MockTransport::new();
+            let (mut pool, pid) = pool_answering(
+                &t,
+                &[
+                    (MessageType::PipelineOutput, cmdlet("Get-Date")),
+                    // Not terminal: the read goes on.
+                    (
+                        MessageType::PipelineState,
+                        state_body(PipelineState::Running),
+                    ),
+                    (MessageType::PipelineState, state_body(state)),
+                ],
+            )
+            .await;
+            let err = pool
+                .get_command_metadata_as(pid, &["Get-*"], CommandType::CMDLET)
+                .await
+                .unwrap_err();
+            match state {
+                PipelineState::Stopped => assert!(matches!(err, PsrpError::Stopped), "{err:?}"),
+                _ => assert!(
+                    matches!(&err, PsrpError::BadState { expected, actual }
+                        if expected == "Completed" && actual == "Disconnected"),
+                    "{err:?}"
+                ),
+            }
+            let _ = pool.close().await;
+        }
+    }
+
+    /// The reply is bounded like a pipeline's, and a reply the client gives
+    /// up on is stopped on the server.
+    #[tokio::test]
+    async fn get_command_metadata_is_bounded_and_stops_what_it_abandons() {
+        let reply = [
+            (MessageType::PipelineOutput, cmdlet("Get-Date")),
+            (MessageType::PipelineOutput, cmdlet("Get-Process")),
+            (
+                MessageType::PipelineState,
+                state_body(PipelineState::Completed),
+            ),
+        ];
+        // A limit that the first object fits in, and the two do not.
+        let mut budget = DecodeBudget::new(usize::MAX);
+        parse_clixml_within(&cmdlet("Get-Date"), &mut budget).unwrap();
+        let one = budget.used() * 3 / 2;
+        assert!(one > 0);
+
+        let t = MockTransport::new();
+        let (mut pool, pid) = pool_answering(&t, &reply).await;
+        pool.set_receive_limits(pool.receive_limits().with_max_pipeline_size(one));
+        let err = pool
+            .get_command_metadata_as(pid, &["Get-*"], CommandType::CMDLET)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PsrpError::Clixml(_)), "{err:?}");
+        assert!(err.to_string().contains("limit"), "{err}");
+        assert!(*t.stopped.lock().unwrap(), "the command was left running");
+        let _ = pool.close().await;
+
+        // A reply that does not decode: same.
+        let t = MockTransport::new();
+        let (mut pool, pid) = pool_answering(
+            &t,
+            &[(MessageType::PipelineOutput, "<I32>x</I32>".to_string())],
+        )
+        .await;
+        let err = pool
+            .get_command_metadata_as(pid, &["Get-*"], CommandType::CMDLET)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PsrpError::Clixml(_)), "{err:?}");
+        assert!(*t.stopped.lock().unwrap(), "the command was left running");
+        let _ = pool.close().await;
+
+        // A transport error is not answered with a stop signal.
+        let t = MockTransport::new();
+        let (mut pool, pid) = pool_answering(&t, &[]).await;
+        let err = pool
+            .get_command_metadata_as(pid, &["Get-*"], CommandType::CMDLET)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("mock inbox empty"), "{err}");
+        assert!(!*t.stopped.lock().unwrap());
         let _ = pool.close().await;
     }
 
     #[tokio::test]
     async fn get_command_metadata_empty_result() {
         let t = MockTransport::new();
-        t.push_incoming(encode_message(1, &opened_state()));
-        t.push_incoming(encode_message(
-            10,
-            &pipeline_state(PipelineState::Completed),
-        ));
-        let mut pool = crate::runspace::RunspacePool::open_with_transport(t)
-            .await
-            .unwrap();
+        let (mut pool, pid) = pool_answering(
+            &t,
+            &[(
+                MessageType::PipelineState,
+                state_body(PipelineState::Completed),
+            )],
+        )
+        .await;
         let cmds = pool
-            .get_command_metadata(&["None-*"], CommandType::CMDLET)
+            .get_command_metadata_as(pid, &["None-*"], CommandType::CMDLET)
             .await
             .unwrap();
-        assert!(cmds.is_empty(), "{cmds:?}");
+        assert_eq!(cmds.len(), 0, "{cmds:?}");
         let _ = pool.close().await;
     }
 

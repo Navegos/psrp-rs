@@ -4,9 +4,10 @@ use uuid::Uuid;
 
 #[cfg(test)]
 use crate::clixml::PsObject;
-use crate::clixml::{PsValue, parse_clixml};
+use crate::clixml::PsValue;
+use crate::clixml::decode::{DecodeBudget, parse_clixml_transient, parse_clixml_within};
 use crate::error::{MAX_SERVER_MESSAGE_CHARS, PsrpError, Result, escape_remote_text};
-use crate::message::MessageType;
+use crate::message::{MessageType, PsrpMessage};
 use crate::records::{
     ErrorRecord, FromPsObject, InformationRecord, ProgressRecord, TraceRecord, WarningRecord,
 };
@@ -296,21 +297,30 @@ impl Pipeline {
     }
 
     /// Execute the pipeline and return only its `Output` stream.
+    ///
+    /// # Errors
+    ///
+    /// Besides the errors of
+    /// [`run_all_streams_with_cancel`](Self::run_all_streams_with_cancel), a
+    /// pipeline the server reports `Disconnected` is a
+    /// [`PsrpError::BadState`]: it did not complete, and the output read so
+    /// far must not pass for the whole of it.
     pub async fn run<T: PsrpTransport>(self, pool: &mut RunspacePool<T>) -> Result<Vec<PsValue>> {
         let result = self.run_all_streams(pool).await?;
-        Ok(result.output)
+        completed_output(result)
     }
 
     /// Execute the pipeline with a cancellation token. When the token is
     /// cancelled the pipeline is stopped cleanly (`signal_ctrl_c`) and a
-    /// [`PsrpError::Cancelled`] is returned.
+    /// [`PsrpError::Cancelled`] is returned. A `Disconnected` pipeline is an
+    /// error, as for [`run`](Self::run).
     pub async fn run_with_cancel<T: PsrpTransport>(
         self,
         pool: &mut RunspacePool<T>,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<Vec<PsValue>> {
         let result = self.run_all_streams_with_cancel(pool, cancel).await?;
-        Ok(result.output)
+        completed_output(result)
     }
 
     /// Execute the pipeline and return a fully-decoded [`PipelineResult`].
@@ -355,6 +365,19 @@ impl Pipeline {
     /// [`PipelineResult`]. If `cancel` fires, the pipeline is stopped
     /// via `signal_ctrl_c` and [`PsrpError::Cancelled`] is returned after
     /// the server ACKs `Stopped`.
+    ///
+    /// `Ok` means the pipeline reached a terminal state that is not a
+    /// failure, not that it completed: check [`PipelineResult::state`], which
+    /// is [`PipelineState::Disconnected`] when the server detached the
+    /// pipeline before its end (the streams then hold what was read so far).
+    ///
+    /// # Errors
+    ///
+    /// [`PsrpError::PipelineFailed`] and [`PsrpError::Stopped`] for those
+    /// terminal states, and whatever ends the read: a transport error, a
+    /// message that does not decode, or one that passes the pool's
+    /// [`ReceiveLimits`](crate::ReceiveLimits). In the last two cases the
+    /// server is asked to stop the command before the error is returned.
     pub async fn run_all_streams_with_cancel<T: PsrpTransport>(
         self,
         pool: &mut RunspacePool<T>,
@@ -369,109 +392,7 @@ impl Pipeline {
         pool.send_pipeline_message(MessageType::CreatePipeline, pid, body)
             .await?;
 
-        let mut cancel_signalled = false;
-
-        let mut result = PipelineResult {
-            state: PipelineState::Running,
-            ..PipelineResult::default()
-        };
-
-        loop {
-            // If the caller asked to cancel, fire a stop signal (once) then
-            // keep draining until the server confirms `Stopped`.
-            if !cancel_signalled && cancel.is_cancelled() {
-                pool.signal_transport_stop().await?;
-                cancel_signalled = true;
-            }
-            let msg = tokio::select! {
-                biased;
-                () = cancel.cancelled(), if !cancel_signalled => {
-                    pool.signal_transport_stop().await?;
-                    cancel_signalled = true;
-                    continue;
-                }
-                msg = pool.next_message() => match msg {
-                    // The transport saw the command disappear after the
-                    // stop signal (WinRM): that is the end of the stop.
-                    Err(PsrpError::Stopped) if cancel_signalled => {
-                        return Err(PsrpError::Cancelled);
-                    }
-                    other => other?,
-                },
-            };
-            // Drop messages that don't belong to this pipeline. A
-            // malicious or buggy server can otherwise smuggle output,
-            // errors, or terminal-state ACKs from a different pipeline
-            // (or a forged PID) into this pipeline's result.
-            if msg.pid != pid || msg.rpid != rpid {
-                tracing::debug!(
-                    expected_pid = %pid,
-                    got_pid = %msg.pid,
-                    expected_rpid = %rpid,
-                    got_rpid = %msg.rpid,
-                    mt = ?msg.message_type,
-                    "dropping pipeline message with mismatched pid/rpid",
-                );
-                continue;
-            }
-            match msg.message_type {
-                MessageType::PipelineOutput => {
-                    for v in parse_clixml(&msg.data)? {
-                        result.output.push(v);
-                    }
-                }
-                MessageType::ErrorRecord => {
-                    for v in parse_clixml(&msg.data)? {
-                        result.errors.push(v);
-                    }
-                }
-                MessageType::WarningRecord => {
-                    for v in parse_clixml(&msg.data)? {
-                        result.warnings.push(v);
-                    }
-                }
-                MessageType::VerboseRecord => {
-                    for v in parse_clixml(&msg.data)? {
-                        result.verbose.push(v);
-                    }
-                }
-                MessageType::DebugRecord => {
-                    for v in parse_clixml(&msg.data)? {
-                        result.debug.push(v);
-                    }
-                }
-                MessageType::InformationRecord => {
-                    for v in parse_clixml(&msg.data)? {
-                        result.information.push(v);
-                    }
-                }
-                MessageType::ProgressRecord => {
-                    for v in parse_clixml(&msg.data)? {
-                        result.progress.push(v);
-                    }
-                }
-                MessageType::PipelineState => {
-                    let state = extract_pipeline_state(&msg.data)?;
-                    result.state = state;
-                    if state.is_terminal() {
-                        if state == PipelineState::Failed {
-                            return Err(PsrpError::PipelineFailed(failure_message(
-                                &msg.data,
-                                &result.errors,
-                            )));
-                        }
-                        if state == PipelineState::Stopped {
-                            if cancel_signalled {
-                                return Err(PsrpError::Cancelled);
-                            }
-                            return Err(PsrpError::Stopped);
-                        }
-                        return Ok(result);
-                    }
-                }
-                _ => continue,
-            }
-        }
+        drain_pipeline(pool, pid, rpid, cancel).await
     }
 
     fn create_pipeline_xml(&self) -> String {
@@ -604,106 +525,165 @@ impl<T: PsrpTransport> PipelineHandle<'_, T> {
         &mut self,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<PipelineResult> {
-        let mut result = PipelineResult {
-            state: PipelineState::Running,
-            ..PipelineResult::default()
-        };
-        let mut cancel_signalled = false;
-        loop {
-            if !cancel_signalled && cancel.is_cancelled() {
-                self.pool.signal_transport_stop().await?;
+        drain_pipeline(self.pool, self.pid, self.rpid, cancel).await
+    }
+}
+
+/// Read the messages of pipeline `pid` until it reaches a terminal state:
+/// the one receive loop behind [`Pipeline::run_all_streams_with_cancel`] and
+/// [`PipelineHandle::collect_with_cancel`].
+///
+/// What the pipeline returns is held in memory until it ends, and the server
+/// decides how much that is, so the values are decoded against the pool's
+/// [`ReceiveLimits::max_pipeline_size`](crate::ReceiveLimits::max_pipeline_size),
+/// all streams together.
+///
+/// When the client gives up on a message it has read (malformed, or past a
+/// limit), the command is still running on the server: it is asked to stop
+/// before the error is returned.
+async fn drain_pipeline<T: PsrpTransport>(
+    pool: &mut RunspacePool<T>,
+    pid: Uuid,
+    rpid: Uuid,
+    cancel: tokio_util::sync::CancellationToken,
+) -> Result<PipelineResult> {
+    let mut budget = DecodeBudget::new(pool.receive_limits().max_pipeline_size());
+    let mut result = PipelineResult {
+        state: PipelineState::Running,
+        ..PipelineResult::default()
+    };
+    let mut cancel_signalled = false;
+    loop {
+        // If the caller asked to cancel, fire a stop signal (once) then
+        // keep draining until the server confirms `Stopped`.
+        if !cancel_signalled && cancel.is_cancelled() {
+            pool.signal_transport_stop().await?;
+            cancel_signalled = true;
+        }
+        let msg = tokio::select! {
+            biased;
+            () = cancel.cancelled(), if !cancel_signalled => {
+                pool.signal_transport_stop().await?;
                 cancel_signalled = true;
-            }
-            let msg = tokio::select! {
-                biased;
-                () = cancel.cancelled(), if !cancel_signalled => {
-                    self.pool.signal_transport_stop().await?;
-                    cancel_signalled = true;
-                    continue;
-                }
-                msg = self.pool.next_message() => match msg {
-                    // The transport saw the command disappear after the
-                    // stop signal (WinRM): that is the end of the stop.
-                    Err(PsrpError::Stopped) if cancel_signalled => {
-                        return Err(PsrpError::Cancelled);
-                    }
-                    other => other?,
-                },
-            };
-            if msg.pid != self.pid || msg.rpid != self.rpid {
-                tracing::debug!(
-                    expected_pid = %self.pid,
-                    got_pid = %msg.pid,
-                    expected_rpid = %self.rpid,
-                    got_rpid = %msg.rpid,
-                    mt = ?msg.message_type,
-                    "dropping pipeline message with mismatched pid/rpid",
-                );
                 continue;
             }
-            match msg.message_type {
-                MessageType::PipelineOutput => {
-                    for v in parse_clixml(&msg.data)? {
-                        result.output.push(v);
-                    }
+            msg = pool.next_message() => match msg {
+                Ok(msg) => msg,
+                // The transport saw the command disappear after the
+                // stop signal (WinRM): that is the end of the stop.
+                Err(PsrpError::Stopped) if cancel_signalled => {
+                    return Err(PsrpError::Cancelled);
                 }
-                MessageType::ErrorRecord => {
-                    for v in parse_clixml(&msg.data)? {
-                        result.errors.push(v);
-                    }
+                Err(e) => {
+                    stop_abandoned_pipeline(pool, cancel_signalled).await;
+                    return Err(e);
                 }
-                MessageType::WarningRecord => {
-                    for v in parse_clixml(&msg.data)? {
-                        result.warnings.push(v);
-                    }
-                }
-                MessageType::VerboseRecord => {
-                    for v in parse_clixml(&msg.data)? {
-                        result.verbose.push(v);
-                    }
-                }
-                MessageType::DebugRecord => {
-                    for v in parse_clixml(&msg.data)? {
-                        result.debug.push(v);
-                    }
-                }
-                MessageType::InformationRecord => {
-                    for v in parse_clixml(&msg.data)? {
-                        result.information.push(v);
-                    }
-                }
-                MessageType::ProgressRecord => {
-                    for v in parse_clixml(&msg.data)? {
-                        result.progress.push(v);
-                    }
-                }
-                MessageType::PipelineState => {
-                    let state = extract_pipeline_state(&msg.data)?;
-                    result.state = state;
-                    if state.is_terminal() {
-                        if state == PipelineState::Failed {
-                            return Err(PsrpError::PipelineFailed(failure_message(
-                                &msg.data,
-                                &result.errors,
-                            )));
-                        }
-                        if state == PipelineState::Stopped {
-                            if cancel_signalled {
-                                return Err(PsrpError::Cancelled);
-                            }
-                            return Err(PsrpError::Stopped);
-                        }
-                        return Ok(result);
-                    }
-                }
-                _ => continue,
+            },
+        };
+        // Drop messages that don't belong to this pipeline. A
+        // malicious or buggy server can otherwise smuggle output,
+        // errors, or terminal-state ACKs from a different pipeline
+        // (or a forged PID) into this pipeline's result.
+        if msg.pid != pid || msg.rpid != rpid {
+            tracing::debug!(
+                expected_pid = %pid,
+                got_pid = %msg.pid,
+                expected_rpid = %rpid,
+                got_rpid = %msg.rpid,
+                mt = ?msg.message_type,
+                "dropping pipeline message with mismatched pid/rpid",
+            );
+            continue;
+        }
+        let state = match file_message(&msg, &mut result, &mut budget) {
+            Ok(state) => state,
+            Err(e) => {
+                stop_abandoned_pipeline(pool, cancel_signalled).await;
+                return Err(e);
             }
+        };
+        match state {
+            Some(PipelineState::Failed) => {
+                return Err(PsrpError::PipelineFailed(failure_message(
+                    &msg.data,
+                    &result.errors,
+                    &budget,
+                )));
+            }
+            Some(PipelineState::Stopped) if cancel_signalled => return Err(PsrpError::Cancelled),
+            Some(PipelineState::Stopped) => return Err(PsrpError::Stopped),
+            Some(state) if state.is_terminal() => return Ok(result),
+            _ => {}
         }
     }
 }
 
-pub(crate) fn extract_pipeline_state(xml: &str) -> Result<PipelineState> {
-    let parsed = parse_clixml(xml)?;
+/// File one message of the pipeline under its stream in `result`, decoded
+/// against `budget`. A `PipelineState` message updates `result.state` and
+/// its state is returned; a message of any other type is ignored.
+fn file_message(
+    msg: &PsrpMessage,
+    result: &mut PipelineResult,
+    budget: &mut DecodeBudget,
+) -> Result<Option<PipelineState>> {
+    let stream = match msg.message_type {
+        MessageType::PipelineOutput => &mut result.output,
+        MessageType::ErrorRecord => &mut result.errors,
+        MessageType::WarningRecord => &mut result.warnings,
+        MessageType::VerboseRecord => &mut result.verbose,
+        MessageType::DebugRecord => &mut result.debug,
+        MessageType::InformationRecord => &mut result.information,
+        MessageType::ProgressRecord => &mut result.progress,
+        MessageType::PipelineState => {
+            // Read and dropped: bounded by the pipeline's limit on its own,
+            // and not taken from it.
+            let state = extract_pipeline_state(&msg.data, budget)?;
+            result.state = state;
+            return Ok(Some(state));
+        }
+        _ => return Ok(None),
+    };
+    stream.extend(parse_clixml_within(&msg.data, budget)?);
+    Ok(None)
+}
+
+/// Ask the server to stop a pipeline the client has just given up on, best
+/// effort: the error that ended the read is the one the caller gets.
+///
+/// Nothing is sent when a stop was already signalled, or when the read ended
+/// on a transport error: the signal would go down the transport that has
+/// just failed. Once the stop is asked for, the transport settles what the
+/// reader leaves behind ([`PsrpTransport::abandon_pipeline`]): over WinRM a
+/// pipeline that was writing output stops only when that output is taken.
+pub(crate) async fn stop_abandoned_pipeline<T: PsrpTransport>(
+    pool: &mut RunspacePool<T>,
+    stop_already_signalled: bool,
+) {
+    if pool.transport_failing() {
+        return;
+    }
+    if !stop_already_signalled && let Err(e) = pool.signal_transport_stop().await {
+        tracing::debug!("stop signal for the abandoned pipeline not sent: {e}");
+        return;
+    }
+    pool.abandon_transport_pipeline().await;
+}
+
+/// The output of a pipeline that ran to its end. `Disconnected` is terminal
+/// but is not that: a caller that gets the output alone cannot tell that it
+/// stops short, so it gets an error instead.
+fn completed_output(result: PipelineResult) -> Result<Vec<PsValue>> {
+    if result.state == PipelineState::Disconnected {
+        return Err(PsrpError::BadState {
+            expected: format!("{:?}", PipelineState::Completed),
+            actual: format!("{:?}", result.state),
+        });
+    }
+    Ok(result.output)
+}
+
+pub(crate) fn extract_pipeline_state(xml: &str, budget: &DecodeBudget) -> Result<PipelineState> {
+    let parsed = parse_clixml_transient(xml, budget)?;
     for v in parsed {
         if let PsValue::Object(obj) = v
             && let Some(PsValue::I32(code)) = obj.get("PipelineState")
@@ -719,8 +699,12 @@ pub(crate) fn extract_pipeline_state(xml: &str) -> Result<PipelineState> {
 /// there, not in the error stream), then the errors written to the error
 /// stream, whichever there are, the same text not repeated. Everything the
 /// server wrote is escaped and bounded.
-pub(crate) fn failure_message(state_data: &str, errors: &[PsValue]) -> String {
-    let reason = crate::runspace::state::terminal_state_reason(state_data);
+pub(crate) fn failure_message(
+    state_data: &str,
+    errors: &[PsValue],
+    budget: &DecodeBudget,
+) -> String {
+    let reason = crate::runspace::state::terminal_state_reason(state_data, budget);
     let (mut parts, more) = describe_parts(errors);
     // Both are trimmed, escaped and cut the same way, so the same error
     // reads the same in each; an error that merely contains the reason
@@ -804,6 +788,16 @@ mod tests {
     use crate::message::{Destination, PsrpMessage};
     use crate::runspace::RunspacePoolState;
     use crate::transport::mock::MockTransport;
+
+    /// `failure_message` with the default budget (shadows the glob import).
+    fn failure_message(state_data: &str, errors: &[PsValue]) -> String {
+        super::failure_message(state_data, errors, &DecodeBudget::default())
+    }
+
+    /// `extract_pipeline_state` with the default budget.
+    fn extract_pipeline_state(xml: &str) -> Result<PipelineState> {
+        super::extract_pipeline_state(xml, &DecodeBudget::default())
+    }
 
     fn make_state_message<T: Into<i32> + Copy>(
         mt: MessageType,
@@ -1677,5 +1671,399 @@ mod tests {
             extract_pipeline_state(&xml).unwrap(),
             PipelineState::Completed
         );
+    }
+
+    // ---------- limits, stop after a local error, Disconnected ----------
+
+    /// A pool, a pipeline id, and `messages` queued for that pipeline.
+    async fn pool_reading(
+        t: &MockTransport,
+        messages: &[(MessageType, &str)],
+    ) -> (RunspacePool<MockTransport>, Uuid) {
+        let pool = opened_pool_with(t).await;
+        let pid = Uuid::new_v4();
+        for (oid, (mt, data)) in (10u64..).zip(messages) {
+            let msg = make_data_message(*mt, (*data).to_string(), pool.id(), pid);
+            t.push_incoming(encode_message(oid, &msg));
+        }
+        (pool, pid)
+    }
+
+    const COMPLETED: &str = r#"<Obj RefId="0"><MS><I32 N="PipelineState">4</I32></MS></Obj>"#;
+    const DISCONNECTED: &str = r#"<Obj RefId="0"><MS><I32 N="PipelineState">6</I32></MS></Obj>"#;
+
+    fn stopped(t: &MockTransport) -> bool {
+        *t.stopped.lock().unwrap()
+    }
+
+    /// How many times the transport was told its reader had given up.
+    fn abandoned(t: &MockTransport) -> u32 {
+        *t.abandoned.lock().unwrap()
+    }
+
+    /// Regression: a `PipelineState` message was decoded against the default
+    /// gibibyte, whatever `max_pipeline_size` said: with a limit of 64 MiB,
+    /// a state message of `<Nil/>` still cost the client a gibibyte.
+    #[tokio::test]
+    async fn a_state_message_is_bounded_by_max_pipeline_size_too() {
+        let node = std::mem::size_of::<PsValue>();
+        // A state carrying a thousand values nobody asked for, once
+        // `Completed` and once `Failed` (read a second time for its reason).
+        let padded = |state: i32| {
+            format!(
+                r#"<Obj RefId="0"><MS><I32 N="PipelineState">{state}</I32></MS><LST>{}</LST></Obj>"#,
+                "<Nil/>".repeat(1000)
+            )
+        };
+        for (state, roomy) in [(4, true), (4, false), (5, true), (5, false)] {
+            let body = padded(state);
+            let t = MockTransport::new();
+            let (mut pool, pid) = pool_reading(&t, &[(MessageType::PipelineState, &body)]).await;
+            let limit = if roomy { 2000 * node } else { 500 * node };
+            pool.set_receive_limits(pool.receive_limits().with_max_pipeline_size(limit));
+            let outcome = Pipeline::new("x")
+                .__with_forced_pid_for_test(pid)
+                .run_all_streams(&mut pool)
+                .await;
+            match (state, roomy) {
+                (4, true) => assert_eq!(outcome.unwrap().state, PipelineState::Completed),
+                (_, true) => {
+                    let err = outcome.unwrap_err();
+                    assert!(matches!(err, PsrpError::PipelineFailed(_)), "{err:?}");
+                }
+                (_, false) => {
+                    let err = outcome.unwrap_err();
+                    assert!(matches!(err, PsrpError::Clixml(_)), "{state}: {err:?}");
+                    assert!(stopped(&t), "{state}: the command is stopped");
+                }
+            }
+            let _ = pool.close().await;
+        }
+    }
+
+    /// The state that ends a pipeline is read even when the output has
+    /// filled the budget to the last byte.
+    #[tokio::test]
+    async fn a_full_budget_does_not_refuse_the_final_state() {
+        let values = "<S>0123456789</S>".repeat(40);
+        let mut budget = DecodeBudget::new(usize::MAX);
+        parse_clixml_within(&values, &mut budget).unwrap();
+
+        let t = MockTransport::new();
+        let messages = [
+            (MessageType::PipelineOutput, values.as_str()),
+            (MessageType::PipelineState, COMPLETED),
+        ];
+        let (mut pool, pid) = pool_reading(&t, &messages).await;
+        pool.set_receive_limits(pool.receive_limits().with_max_pipeline_size(budget.used()));
+        let result = Pipeline::new("x")
+            .__with_forced_pid_for_test(pid)
+            .run_all_streams(&mut pool)
+            .await
+            .unwrap();
+        assert_eq!(result.output.len(), 40);
+        assert_eq!(result.state, PipelineState::Completed);
+        assert!(!stopped(&t));
+        let _ = pool.close().await;
+    }
+
+    /// Regression: an error on a message the client had read (here one that
+    /// does not decode) returned at once, and the command went on running on
+    /// the server with nobody reading it.
+    #[tokio::test]
+    async fn a_message_that_does_not_decode_stops_the_remote_command() {
+        for stream in [
+            MessageType::PipelineOutput,
+            MessageType::ErrorRecord,
+            MessageType::ProgressRecord,
+            MessageType::PipelineState,
+        ] {
+            let t = MockTransport::new();
+            let (mut pool, pid) = pool_reading(&t, &[(stream, "<I32>not a number</I32>")]).await;
+            let err = Pipeline::new("x")
+                .__with_forced_pid_for_test(pid)
+                .run_all_streams(&mut pool)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, PsrpError::Clixml(_)),
+                "{stream:?}: the decode error is the one returned, got {err:?}"
+            );
+            assert!(stopped(&t), "{stream:?}: the command was left running");
+            assert_eq!(abandoned(&t), 1, "{stream:?}: the transport was not told");
+            let _ = pool.close().await;
+        }
+    }
+
+    /// Regression, measured against Windows Server 2025 and 2012 R2: over
+    /// WinRM the stop signal alone does not stop a command that is writing
+    /// output, the output has to be taken. The reader that gives up tells
+    /// the transport (`abandon_pipeline`), once the stop is asked for, also
+    /// when it was the caller's cancellation that asked for it.
+    #[tokio::test]
+    async fn a_reader_that_gives_up_after_a_cancellation_tells_the_transport() {
+        let t = MockTransport::new();
+        let (mut pool, pid) =
+            pool_reading(&t, &[(MessageType::PipelineOutput, "<B>maybe</B>")]).await;
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+        let err = Pipeline::new("x")
+            .__with_forced_pid_for_test(pid)
+            .run_all_streams_with_cancel(&mut pool, token)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PsrpError::Clixml(_)), "{err:?}");
+        assert!(stopped(&t));
+        assert_eq!(abandoned(&t), 1);
+        let _ = pool.close().await;
+    }
+
+    /// Same on the `start` / `collect` path, which shares the loop.
+    #[tokio::test]
+    async fn collect_stops_the_remote_command_after_a_decode_error() {
+        let t = MockTransport::new();
+        let (mut pool, pid) =
+            pool_reading(&t, &[(MessageType::PipelineOutput, "<B>maybe</B>")]).await;
+        let handle = Pipeline::new("x")
+            .__with_forced_pid_for_test(pid)
+            .start(&mut pool)
+            .await
+            .unwrap();
+        let err = handle.collect().await.unwrap_err();
+        assert!(matches!(err, PsrpError::Clixml(_)), "{err:?}");
+        assert!(stopped(&t));
+        let _ = pool.close().await;
+    }
+
+    /// A transport error is not answered with a stop signal: it would go
+    /// down the transport that has just failed.
+    #[tokio::test]
+    async fn a_transport_error_sends_no_stop_signal() {
+        let t = MockTransport::new();
+        let (mut pool, pid) =
+            pool_reading(&t, &[(MessageType::PipelineOutput, "<I32>1</I32>")]).await;
+        let err = Pipeline::new("x")
+            .__with_forced_pid_for_test(pid)
+            .run_all_streams(&mut pool)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("mock inbox empty"), "{err}");
+        assert!(!stopped(&t));
+        assert_eq!(abandoned(&t), 0);
+        let _ = pool.close().await;
+    }
+
+    /// Neither is a pipeline that ended by itself.
+    #[tokio::test]
+    async fn a_failed_or_completed_pipeline_sends_no_stop_signal() {
+        let failed = r#"<Obj RefId="0"><MS><I32 N="PipelineState">5</I32></MS></Obj>"#;
+        for (state, ok) in [(COMPLETED, true), (failed, false)] {
+            let t = MockTransport::new();
+            let (mut pool, pid) = pool_reading(&t, &[(MessageType::PipelineState, state)]).await;
+            let got = Pipeline::new("x")
+                .__with_forced_pid_for_test(pid)
+                .run_all_streams(&mut pool)
+                .await;
+            assert_eq!(got.is_ok(), ok);
+            assert!(!stopped(&t));
+            assert_eq!(abandoned(&t), 0);
+            let _ = pool.close().await;
+        }
+    }
+
+    /// Regression: what a pipeline returned was held without any bound, so a
+    /// command whose output never stops was read until the process ran out
+    /// of memory. The streams now share the pool's `max_pipeline_size`.
+    #[tokio::test]
+    async fn a_pipeline_is_bounded_by_max_pipeline_size() {
+        let node = std::mem::size_of::<PsValue>();
+        let messages = [
+            (MessageType::PipelineOutput, "<I32>1</I32>"),
+            (MessageType::WarningRecord, "<I32>2</I32>"),
+            (MessageType::PipelineOutput, "<I32>3</I32>"),
+            (MessageType::PipelineState, COMPLETED),
+        ];
+
+        // Three values fit in a limit of three.
+        let t = MockTransport::new();
+        let (mut pool, pid) = pool_reading(&t, &messages).await;
+        pool.set_receive_limits(pool.receive_limits().with_max_pipeline_size(3 * node));
+        let result = Pipeline::new("x")
+            .__with_forced_pid_for_test(pid)
+            .run_all_streams(&mut pool)
+            .await
+            .unwrap();
+        assert_eq!(result.output, vec![PsValue::I32(1), PsValue::I32(3)]);
+        assert_eq!(result.warnings, vec![PsValue::I32(2)]);
+        assert!(!stopped(&t));
+        // The limit is per pipeline: the next one starts from nothing.
+        let pid = Uuid::new_v4();
+        for (oid, (mt, data)) in (20u64..).zip(&messages) {
+            let msg = make_data_message(*mt, (*data).to_string(), pool.id(), pid);
+            t.push_incoming(encode_message(oid, &msg));
+        }
+        let again = Pipeline::new("x")
+            .__with_forced_pid_for_test(pid)
+            .run(&mut pool)
+            .await
+            .unwrap();
+        assert_eq!(again.len(), 2);
+        let _ = pool.close().await;
+
+        // One byte less: the third value is refused, whatever its stream,
+        // and the command is stopped.
+        let t = MockTransport::new();
+        let (mut pool, pid) = pool_reading(&t, &messages).await;
+        pool.set_receive_limits(pool.receive_limits().with_max_pipeline_size(3 * node - 1));
+        let err = Pipeline::new("x")
+            .__with_forced_pid_for_test(pid)
+            .run_all_streams(&mut pool)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PsrpError::Clixml(_)), "{err:?}");
+        assert!(err.to_string().contains("limit"), "{err}");
+        assert!(stopped(&t), "the command was left running");
+        let _ = pool.close().await;
+    }
+
+    /// A message over `max_message_size` ends the pipeline the same way.
+    #[tokio::test]
+    async fn a_message_over_the_size_limit_stops_the_remote_command() {
+        let t = MockTransport::new();
+        let big = format!("<S>{}</S>", "x".repeat(4096));
+        let (mut pool, pid) = pool_reading(&t, &[(MessageType::PipelineOutput, &big)]).await;
+        pool.set_receive_limits(pool.receive_limits().with_max_message_size(1024));
+        let err = Pipeline::new("x")
+            .__with_forced_pid_for_test(pid)
+            .run(&mut pool)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PsrpError::Fragment(_)), "{err:?}");
+        assert!(stopped(&t), "the command was left running");
+        let _ = pool.close().await;
+    }
+
+    /// Regression: `Disconnected` is terminal, so `run` returned the output
+    /// read so far as if the pipeline had completed.
+    #[tokio::test]
+    async fn a_disconnected_pipeline_is_not_a_completed_one() {
+        let messages = [
+            (MessageType::PipelineOutput, "<I32>1</I32>"),
+            (MessageType::PipelineState, DISCONNECTED),
+        ];
+        let expect_bad_state = |err: PsrpError| {
+            let PsrpError::BadState { expected, actual } = err else {
+                panic!("expected BadState, got {err:?}");
+            };
+            assert_eq!(
+                (expected.as_str(), actual.as_str()),
+                ("Completed", "Disconnected")
+            );
+        };
+
+        let t = MockTransport::new();
+        let (mut pool, pid) = pool_reading(&t, &messages).await;
+        let err = Pipeline::new("x")
+            .__with_forced_pid_for_test(pid)
+            .run(&mut pool)
+            .await
+            .unwrap_err();
+        expect_bad_state(err);
+        let _ = pool.close().await;
+
+        let t = MockTransport::new();
+        let (mut pool, pid) = pool_reading(&t, &messages).await;
+        let err = Pipeline::new("x")
+            .__with_forced_pid_for_test(pid)
+            .run_with_cancel(&mut pool, tokio_util::sync::CancellationToken::new())
+            .await
+            .unwrap_err();
+        expect_bad_state(err);
+        let _ = pool.close().await;
+
+        // With every stream the caller sees the state, and what was read.
+        let t = MockTransport::new();
+        let (mut pool, pid) = pool_reading(&t, &messages).await;
+        let result = Pipeline::new("x")
+            .__with_forced_pid_for_test(pid)
+            .run_all_streams(&mut pool)
+            .await
+            .unwrap();
+        assert_eq!(result.state, PipelineState::Disconnected);
+        assert_eq!(result.output, vec![PsValue::I32(1)]);
+        assert!(!stopped(&t));
+        let _ = pool.close().await;
+    }
+
+    #[test]
+    fn completed_output_passes_every_other_state() {
+        for state in [PipelineState::Completed, PipelineState::Running] {
+            let result = PipelineResult {
+                output: vec![PsValue::I32(1)],
+                state,
+                ..PipelineResult::default()
+            };
+            assert_eq!(completed_output(result).unwrap(), vec![PsValue::I32(1)]);
+        }
+    }
+
+    /// Every stream message type goes to its own stream, and nothing else is
+    /// filed.
+    #[test]
+    fn file_message_routes_each_stream() {
+        let streams = [
+            MessageType::PipelineOutput,
+            MessageType::ErrorRecord,
+            MessageType::WarningRecord,
+            MessageType::VerboseRecord,
+            MessageType::DebugRecord,
+            MessageType::InformationRecord,
+            MessageType::ProgressRecord,
+        ];
+        let mut result = PipelineResult::default();
+        let mut budget = DecodeBudget::new(usize::MAX);
+        let message = |message_type, data: String| PsrpMessage {
+            destination: Destination::Client,
+            message_type,
+            rpid: Uuid::nil(),
+            pid: Uuid::nil(),
+            data,
+        };
+        for (n, mt) in (0i32..).zip(streams) {
+            let filed = file_message(
+                &message(mt, format!("<I32>{n}</I32>")),
+                &mut result,
+                &mut budget,
+            );
+            assert_eq!(filed.unwrap(), None);
+        }
+        let got = [
+            &result.output,
+            &result.errors,
+            &result.warnings,
+            &result.verbose,
+            &result.debug,
+            &result.information,
+            &result.progress,
+        ];
+        for (n, stream) in (0i32..).zip(got) {
+            assert_eq!(stream, &vec![PsValue::I32(n)], "stream {n}");
+        }
+
+        let filed = file_message(
+            &message(MessageType::PipelineState, COMPLETED.into()),
+            &mut result,
+            &mut budget,
+        );
+        assert_eq!(filed.unwrap(), Some(PipelineState::Completed));
+        assert_eq!(result.state, PipelineState::Completed);
+
+        let ignored = file_message(
+            &message(MessageType::ApplicationPrivateData, "<I32>9</I32>".into()),
+            &mut result,
+            &mut budget,
+        );
+        assert_eq!(ignored.unwrap(), None);
+        assert_eq!(result.output, vec![PsValue::I32(0)]);
     }
 }

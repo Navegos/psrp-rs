@@ -2,13 +2,12 @@
 name = "psrp-rs"
 version = "4.0.0"
 edition = "2024"
-rust-version = "1.98"
+rust-version = "1.100"
 license = "MIT OR Apache-2.0"
 authors = ["Wernert Loïc <45450136+muchiny@users.noreply.github.com>"]
 description = "Async PowerShell Remoting Protocol (MS-PSRP) client for Rust, built on winrm-rs."
 repository = "https://github.com/muchiny/psrp-rs"
 documentation = "https://docs.rs/psrp-rs"
-homepage = "https://github.com/muchiny/psrp-rs"
 keywords = ["powershell", "psrp", "winrm", "remoting", "windows"]
 categories = ["network-programming", "api-bindings"]
 readme = "README.md"
@@ -23,20 +22,30 @@ include = [
     "CHANGELOG.md",
 ]
 
+# docs.rs builds with the default features unless told otherwise: without
+# this, `psrp_rs::ssh` and the serde impls are missing from the published
+# documentation. Not `all-features`: `__internal` is not part of the API.
+[package.metadata.docs.rs]
+features = ["ssh", "serde"]
+
 [dependencies]
 # The winrm-rs major is part of the psrp-rs API: `lib.rs` re-exports its
 # client, configuration and error types, so moving to another major is a
-# psrp-rs major too. The 2.x line keeps everything the old 1.3.0 floor was
-# for (the `ResourceURI` injection fix, `Shell::close` and `disconnect` on
+# psrp-rs major too. The 3.x line keeps everything the earlier floors were
+# for: the `ResourceURI` injection fix, `Shell::close` and `disconnect` on
 # a PSRP shell, NTLM sealing that fails closed, TLS on `ring` only, so no
-# `aws-lc-sys`) and the 1.4.1 fixes (the PSRP stop signal, the handshake
-# signature checked under `accept_invalid_certs`). What psrp-rs users
-# inherit from 2.x: HTTPS on 5986 with the certificate validated by
-# default, environment proxies opt-in, Basic refused over plain HTTP
-# unless encryption is off, and no process-wide rustls provider installed.
-# 2.0.1 rather than 2.0.0: its parsers of server input (NTLM, ASN.1, SOAP)
-# use checked access only, and `hmac` leaves the dependency tree.
-winrm-rs = "2.0.1"
+# `aws-lc-sys` (1.3.0); the PSRP stop signal and the handshake signature
+# checked under `accept_invalid_certs` (1.4.1); HTTPS on 5986 with the
+# certificate validated by default, environment proxies opt-in, Basic
+# refused over plain HTTP unless encryption is off, no process-wide rustls
+# provider installed, parsers of server input that use checked access only
+# (2.x). What psrp-rs users meet in 3.0: `WinrmError` says what failed by
+# its variant (`AuthFailed` is gone), the error enums, `AuthMethod` and
+# `EncryptionMode` are `#[non_exhaustive]`, and a server's SOAP answers are
+# read with an XML parser. winrm-rs ships security fixes for its latest
+# minor only, so the floor follows it; 3.0 needs Rust 1.100, hence
+# `rust-version` above.
+winrm-rs = "3.0.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 thiserror = "2"
@@ -45,6 +54,10 @@ quick-xml = "0.42"
 uuid = { version = "1", features = ["v4"] }
 indexmap = { version = "2" }
 async-trait = "0.1"
+# Held at 0.9, and `rand` at 0.8 with it (rsa 0.9 takes `rand_core` 0.6
+# generators). `rsa` 0.10.0 fixes RUSTSEC-2023-0071, but `russh` 0.65.1
+# requires `rsa = "=0.10.0-rc.18"` and Cargo keeps a single 0.10.x, so
+# `rsa = "0.10"` fails to resolve under `ssh`. Details in `deny.toml`.
 rsa = { version = "0.9", default-features = false }
 aes = "0.9"
 rand = "0.8"
@@ -88,6 +101,10 @@ module_name_repetitions = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 must_use_candidate = "allow"
+# The four pedantic cast lints stay off because `as_conversions` (below)
+# already denies every `as` in library code. Turned on, they only add a
+# second diagnostic on the one `#[expect]`ed cast (f64 to f32 in
+# `clixml/decode.rs`) and on test code, which is exempt from `as_conversions`.
 cast_possible_truncation = "allow"
 cast_sign_loss = "allow"
 cast_lossless = "allow"

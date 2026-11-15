@@ -17,7 +17,7 @@
 pub(crate) mod decode;
 pub(crate) mod encode;
 
-pub use decode::{MAX_NESTING_DEPTH, parse_clixml};
+pub use decode::{DEFAULT_MAX_DECODED_SIZE, MAX_NESTING_DEPTH, parse_clixml};
 pub use encode::{RefIdAllocator, escape, ps_enum, ps_host_info_null, to_clixml};
 
 use indexmap::IndexMap;
@@ -28,7 +28,11 @@ use uuid::Uuid;
 /// Variants cover the full MS-PSRP primitive set plus complex types.
 /// Integer, floating-point, and date/time types are distinct so that
 /// round-tripping through PowerShell preserves the exact CLIXML tag.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `Debug` prints every variant as a derive would, except
+/// [`SecureString`](Self::SecureString), whose content is never printed:
+/// it reads `SecureString(<redacted>)`.
+#[derive(Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum PsValue {
     /// `<Nil/>` or a missing value.
@@ -129,6 +133,52 @@ pub enum PsValue {
     Dict(Vec<(PsValue, PsValue)>),
     /// A wrapped `<Obj>` carrying a member set `<MS>`.
     Object(PsObject),
+}
+
+impl std::fmt::Debug for PsValue {
+    /// What `#[derive(Debug)]` would print, `{:#?}` included, with the
+    /// content of a `SecureString` left out: it is a secret in clear when a
+    /// [`PsHost`](crate::PsHost) returned it, and values get printed (an
+    /// `assert_eq!`, a `tracing` field, an error message built from an
+    /// unexpected value).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fn tuple(
+            f: &mut std::fmt::Formatter<'_>,
+            name: &str,
+            field: &dyn std::fmt::Debug,
+        ) -> std::fmt::Result {
+            f.debug_tuple(name).field(field).finish()
+        }
+        match self {
+            Self::Null => f.write_str("Null"),
+            Self::Bool(v) => tuple(f, "Bool", v),
+            Self::I8(v) => tuple(f, "I8", v),
+            Self::U8(v) => tuple(f, "U8", v),
+            Self::I16(v) => tuple(f, "I16", v),
+            Self::U16(v) => tuple(f, "U16", v),
+            Self::I32(v) => tuple(f, "I32", v),
+            Self::U32(v) => tuple(f, "U32", v),
+            Self::I64(v) => tuple(f, "I64", v),
+            Self::U64(v) => tuple(f, "U64", v),
+            Self::F32(v) => tuple(f, "F32", v),
+            Self::Double(v) => tuple(f, "Double", v),
+            Self::Decimal(v) => tuple(f, "Decimal", v),
+            Self::Char(v) => tuple(f, "Char", v),
+            Self::String(v) => tuple(f, "String", v),
+            Self::Bytes(v) => tuple(f, "Bytes", v),
+            Self::DateTime(v) => tuple(f, "DateTime", v),
+            Self::Duration(v) => tuple(f, "Duration", v),
+            Self::Guid(v) => tuple(f, "Guid", v),
+            Self::Version(v) => tuple(f, "Version", v),
+            Self::Uri(v) => tuple(f, "Uri", v),
+            Self::Xml(v) => tuple(f, "Xml", v),
+            Self::ScriptBlock(v) => tuple(f, "ScriptBlock", v),
+            Self::SecureString(_) => tuple(f, "SecureString", &format_args!("<redacted>")),
+            Self::List(v) => tuple(f, "List", v),
+            Self::Dict(v) => tuple(f, "Dict", v),
+            Self::Object(v) => tuple(f, "Object", v),
+        }
+    }
 }
 
 impl PsValue {
@@ -364,5 +414,88 @@ mod tests {
         assert!(PsValue::I32(1).type_names().is_none());
         assert!(PsValue::String("x".into()).type_names().is_none());
         assert!(PsValue::Bool(false).type_names().is_none());
+    }
+
+    /// `Debug` is hand-written to keep a `SecureString` out of it; for every
+    /// other variant it must read as the derive did.
+    #[test]
+    fn debug_reads_like_a_derive() {
+        let guid = Uuid::nil();
+        let cases: Vec<(PsValue, &str)> = vec![
+            (PsValue::Null, "Null"),
+            (PsValue::Bool(true), "Bool(true)"),
+            (PsValue::I8(-1), "I8(-1)"),
+            (PsValue::U8(1), "U8(1)"),
+            (PsValue::I16(-2), "I16(-2)"),
+            (PsValue::U16(2), "U16(2)"),
+            (PsValue::I32(-3), "I32(-3)"),
+            (PsValue::U32(3), "U32(3)"),
+            (PsValue::I64(-4), "I64(-4)"),
+            (PsValue::U64(4), "U64(4)"),
+            (PsValue::F32(1.5), "F32(1.5)"),
+            (PsValue::Double(2.5), "Double(2.5)"),
+            (PsValue::Decimal("1.0".into()), r#"Decimal("1.0")"#),
+            (PsValue::Char('c'), "Char('c')"),
+            (PsValue::String("a\"b".into()), r#"String("a\"b")"#),
+            (PsValue::Bytes(vec![1, 2]), "Bytes([1, 2])"),
+            (PsValue::DateTime("d".into()), r#"DateTime("d")"#),
+            (PsValue::Duration("t".into()), r#"Duration("t")"#),
+            (
+                PsValue::Guid(guid),
+                "Guid(00000000-0000-0000-0000-000000000000)",
+            ),
+            (PsValue::Version("1.2".into()), r#"Version("1.2")"#),
+            (PsValue::Uri("u".into()), r#"Uri("u")"#),
+            (PsValue::Xml("<x/>".into()), r#"Xml("<x/>")"#),
+            (PsValue::ScriptBlock("gci".into()), r#"ScriptBlock("gci")"#),
+            (
+                PsValue::List(vec![PsValue::Null, PsValue::I32(1)]),
+                "List([Null, I32(1)])",
+            ),
+            (
+                PsValue::Dict(vec![(PsValue::String("k".into()), PsValue::Bool(false))]),
+                r#"Dict([(String("k"), Bool(false))])"#,
+            ),
+        ];
+        for (value, expected) in cases {
+            assert_eq!(format!("{value:?}"), expected);
+        }
+        let object = PsValue::Object(PsObject::new().with("a", PsValue::I32(1)));
+        assert_eq!(
+            format!("{object:?}"),
+            r#"Object(PsObject { properties: {"a": I32(1)}, type_names: [], to_string: None })"#
+        );
+        // The alternate form nests as a derive's does.
+        assert_eq!(
+            format!("{:#?}", PsValue::List(vec![PsValue::I32(1)])),
+            "List(\n    [\n        I32(\n            1,\n        ),\n    ],\n)"
+        );
+    }
+
+    /// Regression: `Debug` printed a `SecureString` like any string, and a
+    /// [`PsHost`](crate::PsHost) returns its secrets in clear in that
+    /// variant.
+    #[test]
+    fn debug_never_prints_a_secure_string() {
+        let secret = || PsValue::SecureString("hunter2".into());
+        assert_eq!(format!("{:?}", secret()), "SecureString(<redacted>)");
+        assert_eq!(
+            format!("{:#?}", secret()),
+            "SecureString(\n    <redacted>,\n)"
+        );
+
+        let nested = PsValue::List(vec![
+            PsValue::Dict(vec![(secret(), secret())]),
+            PsValue::Object(
+                PsObject::new()
+                    .with("UserName", PsValue::String("alice".into()))
+                    .with("Password", secret()),
+            ),
+        ]);
+        for printed in [format!("{nested:?}"), format!("{nested:#?}")] {
+            assert!(!printed.contains("hunter2"), "{printed}");
+            assert_eq!(printed.matches("<redacted>").count(), 3, "{printed}");
+            assert!(printed.contains("alice"), "{printed}");
+        }
     }
 }

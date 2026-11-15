@@ -22,11 +22,13 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # Dated nightly, not the floating one: nightly-2026-11-01 (rustc f9ceb4a4d,
-  # 2026-10-31) fails to compile russh with "cycle detected when computing
+  # Dated nightly, not the floating one, so that a nightly regression cannot
+  # stop the fuzz jobs unannounced: nightly-2026-11-01 (rustc f9ceb4a4d,
+  # 2026-10-31) failed to compile russh with "cycle detected when computing
   # when ssh_key::public::key_data::KeyData needs async drop"
-  # (rust-lang/rust#165263). Raise it once that issue is fixed.
-  FUZZ_TOOLCHAIN: nightly-2026-10-30
+  # (rust-lang/rust#165263, reverted by #165266). Raise the date on purpose,
+  # once `cargo fuzz build` passes on the new one.
+  FUZZ_TOOLCHAIN: nightly-2026-11-05
 
 jobs:
   build:

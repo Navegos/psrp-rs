@@ -10,5 +10,5 @@
 pub mod pool;
 pub mod state;
 
-pub use pool::{DisconnectedPool, RunspacePool};
+pub use pool::{DisconnectedPool, ReceiveLimits, RunspacePool};
 pub use state::{Action, PROTOCOL_VERSION, RunspacePoolState, RunspacePoolStateMachine};
