@@ -47,8 +47,11 @@ jobs:
       - run: cargo install cargo-fuzz --locked
       - run: cargo +${{ env.FUZZ_TOOLCHAIN }} fuzz build
       # The seed corpus is generated from the crate's own encoders, so a
-      # wire-format change must regenerate it.
-      - run: cargo run --example generate_fuzz_corpus
+      # wire-format change must regenerate it. With the fuzz toolchain, the
+      # only one this job installs: `rust-toolchain.toml` asks for `stable`,
+      # and the one the runner comes with can be older than the MSRV (1.99.1
+      # when `winrm-rs` 3 raised it to 1.100).
+      - run: cargo +${{ env.FUZZ_TOOLCHAIN }} run --example generate_fuzz_corpus
       # `git diff` ignores untracked files and the generator starts from an
       # empty `fuzz/seeds`, so `git status` is what sees a seed that was
       # added, changed or removed.
