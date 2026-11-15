@@ -6,11 +6,16 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [5.0.0] — 2026-11-15
+
 `winrm-rs` 3.0.0 or later is now required. The `AuthMethod`,
 `EncryptionMode`, `WinrmClient`, `WinrmConfig`, `WinrmCredentials` and
-`WinrmError` that psrp-rs re-exports are the `winrm-rs` 3 types, so the
-release that carries this is a major one. Read *Upgrading from 4.x* first,
-then the *Upgrading from 2.x* section of the [`winrm-rs` 3.0.0
+`WinrmError` that psrp-rs re-exports are the `winrm-rs` 3 types, so this is
+a major release. It also bounds what a pool accepts from the server and
+stops the commands the client gives up on (*Security*), and fixes, over
+WinRM, the cancellation of a pipeline that is writing output and
+`get_command_metadata` (*Fixed*). Read *Upgrading from 4.x* first, then the
+*Upgrading from 2.x* section of the [`winrm-rs` 3.0.0
 changelog](https://github.com/muchiny/winrm-rs/blob/main/CHANGELOG.md).
 
 ### Upgrading from 4.x
@@ -1092,7 +1097,8 @@ as well as everything below.
 - Fragment layer, message header, basic CLIXML primitives, runspace
   pool, pipeline builder, transport trait, live Vagrant integration.
 
-[Unreleased]: https://github.com/muchiny/psrp-rs/compare/v4.0.0...HEAD
+[Unreleased]: https://github.com/muchiny/psrp-rs/compare/v5.0.0...HEAD
+[5.0.0]: https://github.com/muchiny/psrp-rs/compare/v4.0.0...v5.0.0
 [4.0.0]: https://github.com/muchiny/psrp-rs/compare/v3.1.0...v4.0.0
 [3.1.0]: https://github.com/muchiny/psrp-rs/compare/v3.0.0...v3.1.0
 [3.0.0]: https://github.com/muchiny/psrp-rs/compare/v2.0.2...v3.0.0
