@@ -9,7 +9,8 @@
 
 use uuid::Uuid;
 
-use crate::clixml::{PsObject, PsValue, parse_clixml, to_clixml};
+use crate::clixml::decode::{DecodeBudget, parse_clixml_transient};
+use crate::clixml::{PsObject, PsValue, to_clixml};
 use crate::error::{MAX_SERVER_MESSAGE_CHARS, PsrpError, Result, escape_remote_text};
 use crate::message::{MessageType, PsrpMessage};
 use crate::records::{ErrorRecord, FromPsObject};
@@ -213,10 +214,25 @@ impl RunspacePoolStateMachine {
     /// Server-driven transitions that violate the MS-PSRP §2.2.3.4
     /// lifecycle are rejected with `PsrpError::Protocol` so a malicious
     /// or buggy server cannot push the client into an arbitrary state.
+    ///
+    /// The message is decoded within
+    /// [`DEFAULT_MAX_DECODED_SIZE`](crate::clixml::DEFAULT_MAX_DECODED_SIZE);
+    /// a [`RunspacePool`](crate::RunspacePool) uses its
+    /// [`ReceiveLimits`](crate::ReceiveLimits) instead.
     pub fn on_message(&mut self, msg: &PsrpMessage) -> Result<()> {
+        self.on_message_within(msg, &DecodeBudget::default())
+    }
+
+    /// [`on_message`](Self::on_message), the message decoded within the
+    /// limit of `budget`.
+    pub(crate) fn on_message_within(
+        &mut self,
+        msg: &PsrpMessage,
+        budget: &DecodeBudget,
+    ) -> Result<()> {
         match msg.message_type {
             MessageType::RunspacePoolState => {
-                let new_state = extract_runspace_state(&msg.data)?;
+                let new_state = extract_runspace_state(&msg.data, budget)?;
                 if !is_legal_server_transition(self.state, new_state) {
                     return Err(PsrpError::protocol(format!(
                         "illegal RunspacePool transition {:?} -> {:?}",
@@ -226,7 +242,7 @@ impl RunspacePoolStateMachine {
                 self.state = new_state;
                 match new_state {
                     RunspacePoolState::Broken | RunspacePoolState::Closed => {
-                        let reason = terminal_state_reason(&msg.data)
+                        let reason = terminal_state_reason(&msg.data, budget)
                             .map_or_else(String::new, |reason| format!(": {reason}"));
                         return Err(PsrpError::protocol(format!(
                             "runspace pool entered terminal state {new_state:?}{reason}"
@@ -378,8 +394,11 @@ pub(crate) fn init_runspace_pool_xml(min: i32, max: i32) -> String {
     to_clixml(&obj)
 }
 
-pub(crate) fn extract_runspace_state(xml: &str) -> Result<RunspacePoolState> {
-    let parsed = parse_clixml(xml)?;
+pub(crate) fn extract_runspace_state(
+    xml: &str,
+    budget: &DecodeBudget,
+) -> Result<RunspacePoolState> {
+    let parsed = parse_clixml_transient(xml, budget)?;
     for value in parsed {
         if let PsValue::Object(obj) = value
             && let Some(PsValue::I32(code)) = obj.get("RunspaceState")
@@ -401,8 +420,9 @@ pub(crate) fn extract_runspace_state(xml: &str) -> Result<RunspacePoolState> {
 /// server sent a bare string). The server writes it, so it is trimmed,
 /// escaped and bounded like any server text quoted in an error, and a
 /// blank one counts as none.
-pub(crate) fn terminal_state_reason(xml: &str) -> Option<String> {
-    let message = parse_clixml(xml).ok()?.into_iter().find_map(|value| {
+pub(crate) fn terminal_state_reason(xml: &str, budget: &DecodeBudget) -> Option<String> {
+    let parsed = parse_clixml_transient(xml, budget).ok()?;
+    let message = parsed.into_iter().find_map(|value| {
         let PsValue::Object(obj) = value else {
             return None;
         };
@@ -674,7 +694,8 @@ mod tests {
 
     #[test]
     fn extract_runspace_state_missing_property() {
-        assert!(extract_runspace_state("<Obj RefId=\"0\"><MS/></Obj>").is_err());
+        let budget = DecodeBudget::default();
+        assert!(extract_runspace_state("<Obj RefId=\"0\"><MS/></Obj>", &budget).is_err());
     }
 
     #[test]
@@ -683,7 +704,7 @@ mod tests {
             PsObject::new().with("RunspaceState", PsValue::I32(2)),
         ));
         assert_eq!(
-            extract_runspace_state(&xml).unwrap(),
+            extract_runspace_state(&xml, &DecodeBudget::default()).unwrap(),
             RunspacePoolState::Opened
         );
     }

@@ -36,10 +36,11 @@ pub mod base64 {
 /// unreachable from outside the crate.
 pub mod parse {
     use super::{PipelineState, PsValue, Result};
+    use crate::clixml::decode::DecodeBudget;
 
     /// Extract a `<PipelineState>` value out of a `PipelineState` message body.
     pub fn extract_pipeline_state(xml: &str) -> Result<PipelineState> {
-        crate::pipeline::extract_pipeline_state(xml)
+        crate::pipeline::extract_pipeline_state(xml, &DecodeBudget::default())
     }
 
     /// Render a list of CLIXML error values into a human-readable string.
@@ -50,13 +51,13 @@ pub mod parse {
 
     /// The `PipelineFailed` message (`pipeline::failure_message`).
     pub fn failure_message(state_data: &str, errors: &[PsValue]) -> String {
-        crate::pipeline::failure_message(state_data, errors)
+        crate::pipeline::failure_message(state_data, errors, &DecodeBudget::default())
     }
 
     /// Best-effort `PipelineState` extraction used by the metadata helper.
     #[must_use]
     pub fn state_from_xml(xml: &str) -> Option<PipelineState> {
-        crate::metadata::state_from_xml(xml)
+        crate::metadata::state_from_xml(xml, &DecodeBudget::default())
     }
 
     /// Decode a `Get-Command` metadata object.

@@ -5,7 +5,7 @@ Async [PowerShell Remoting Protocol (MS-PSRP)](https://learn.microsoft.com/en-us
 [![Crates.io](https://img.shields.io/crates/v/psrp-rs.svg)](https://crates.io/crates/psrp-rs)
 [![docs.rs](https://img.shields.io/docsrs/psrp-rs)](https://docs.rs/psrp-rs)
 [![License](https://img.shields.io/crates/l/psrp-rs.svg)](LICENSE-MIT)
-[![MSRV](https://img.shields.io/badge/MSRV-1.98-blue.svg)](https://blog.rust-lang.org/)
+[![MSRV](https://img.shields.io/badge/MSRV-1.100-blue.svg)](https://blog.rust-lang.org/)
 
 ```rust
 use psrp_rs::{RunspacePool, WinrmClient, WinrmConfig, WinrmCredentials, WinrmPsrpTransport};
@@ -39,11 +39,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - **Typed PowerShell objects** -- Output stream returns `PsValue` / `PsObject` with properties, not raw strings
 - **All 7 PSRP streams** -- Output, Error, Warning, Verbose, Debug, Information, Progress, each isolated
 - **Pipeline builder** -- compose multi-command pipelines with named parameters, positional arguments, and switches
-- **Persistent runspace pool** -- keeps a `powershell.exe` process alive across many pipelines
+- **Pipeline input** -- stream objects into a running pipeline (`Pipeline::with_input`, `PipelineHandle::write_input`)
+- **Persistent runspace pool** -- keeps the remote PowerShell host process alive across many pipelines (`wsmprovhost.exe` over WinRM, `pwsh` over SSH)
+- **Disconnect / reconnect** -- over WinRM, `RunspacePool::disconnect` leaves the runspace alive on the server and `DisconnectedPool::reconnect` resumes it
 - **Cancellation** -- `CancellationToken`-based abort for long-running scripts
 - **Session-key cryptography** -- RSA key exchange + AES-256-CBC for `SecureString` encrypt/decrypt
-- **Host call dispatch** -- pluggable `PsHost` trait for interactive prompts (`Read-Host`, `Write-Host`, etc.)
+- **Host call dispatch** -- pluggable `PsHost` trait for interactive prompts (`Read-Host`, `Write-Host`, etc.). Not reachable against a real server yet: the pool still declares a null host, so PowerShell makes no host call ([#52](https://github.com/muchiny/psrp-rs/issues/52))
 - **Command metadata** -- `Get-Command` introspection via `get_command_metadata`
+- **Bounded input** -- what the server sends is capped (`ReceiveLimits`: message size, memory per pipeline; CLIXML nesting and reference expansion), so a hostile or broken host gets an error, not the client's memory
 - **Shared pool** -- `SharedRunspacePool` for multi-task access behind `Arc<Mutex<_>>`
 - **Blocking wrapper** -- synchronous API for CLI tools and scripts
 - **SSH transport** -- feature-gated (`--features ssh`) alternative to WinRM via `russh`
@@ -65,7 +68,25 @@ cargo add psrp-rs --features serde
 `WinrmConfig`, `WinrmClientBuilder`, ...), so the common settings need no
 direct dependency on `winrm-rs`. A crate that imports `winrm_rs` itself
 (for `TlsProvider`, `ProxySessionAuth`, or the `kerberos` feature) must
-use the same major: `winrm-rs = "2"` for `psrp-rs` 4.
+use the same major: `winrm-rs = "3"` for `psrp-rs` 5, `"2"` for `psrp-rs` 4.
+
+### Upgrading to 5.0
+
+`psrp-rs` 5.0 moves to `winrm-rs` 3. The changes callers meet, all from
+`winrm-rs`:
+
+- `WinrmError`, which `PsrpError::Winrm` holds, says what failed by its
+  variant. `AuthFailed` is gone: refused credentials are `AuthRejected`, a
+  client or a host that cannot be used as configured is `Config`, an HTTP
+  status that is neither a SOAP fault nor a 401 is `HttpStatus`, and so on.
+  Code that only shows the error or passes it on with `?` compiles as it
+  is.
+- `WinrmError`, `AuthMethod` and `EncryptionMode` are `#[non_exhaustive]`:
+  a `match` on one of them needs a wildcard arm.
+- Rust 1.100 is required.
+
+The full list is in [CHANGELOG.md](CHANGELOG.md) (*Upgrading from 4.x*) and
+in the `winrm-rs` 3.0.0 changelog (*Upgrading from 2.x*).
 
 ### Upgrading to 4.0
 
@@ -242,21 +263,30 @@ use psrp_rs::SharedRunspacePool;
 
 let shared = SharedRunspacePool::new(pool);
 
-let s1 = shared.clone();
-let t1 = tokio::spawn(async move { s1.run_script("Get-Date").await });
+// A handle is a cheap clone; each call takes the pool's lock in turn.
+let (s1, s2) = (shared.clone(), shared.clone());
+let (date, host) = tokio::join!(
+    async move { s1.run_script("Get-Date").await },
+    async move { s2.run_script("hostname").await },
+);
 
-let s2 = shared.clone();
-let t2 = tokio::spawn(async move { s2.run_script("hostname").await });
-
-let (r1, r2) = tokio::join!(t1, t2);
+// Only the last handle can close the pool.
 shared.close().await?;
 ```
 
+The handles can also move into `tokio::spawn` tasks when the pool is
+`'static`. A pool over the SSH transport is: `SshPsrpTransport` owns its
+connection. A pool over WinRM borrows its `WinrmClient`
+(`WinrmPsrpTransport<'_>`), so it can only be spawned if the client lives
+in a `static` (a `OnceLock`, or `Box::leak`); otherwise join the handles in
+one task, as above. Either way the pipelines run one after the other:
+the wrapper is a mutex around the pool, not concurrent execution.
+
 ## Configuration
 
-`psrp-rs` reuses [`WinrmConfig`](https://docs.rs/winrm-rs/2/winrm_rs/struct.WinrmConfig.html)
-from `winrm-rs` 2 for transport-level settings (auth method, TLS, timeouts, proxy).
-See the [winrm-rs documentation](https://docs.rs/winrm-rs/2) for the full list of config fields.
+`psrp-rs` reuses [`WinrmConfig`](https://docs.rs/winrm-rs/3/winrm_rs/struct.WinrmConfig.html)
+from `winrm-rs` 3 for transport-level settings (auth method, TLS, timeouts, proxy).
+See the [winrm-rs documentation](https://docs.rs/winrm-rs/3) for the full list of config fields.
 The defaults that matter most:
 
 - **TLS.** `WinrmConfig::default()` and `WinrmConfig::https()` connect over
@@ -281,7 +311,7 @@ The defaults that matter most:
   with a validated or pinned certificate.
 - **Limits.** `WinrmConfig::max_output_bytes` does not bound PSRP: a
   pipeline's output is collected by psrp-rs, not by winrm-rs's
-  `run_command`.
+  `run_command`. psrp-rs has its own bounds, `ReceiveLimits`, below.
 
 Pool-level parameters:
 
@@ -293,12 +323,37 @@ Pool-level parameters:
 Set via `RunspacePool::open_with_options(transport, min, max)` or
 `build_creation_fragments(min, max)` + `open_from_transport(...)`.
 
+What a pool accepts from the server is bounded by
+[`ReceiveLimits`](https://docs.rs/psrp-rs/latest/psrp_rs/struct.ReceiveLimits.html):
+
+| Limit | Default | Description |
+|---|---|---|
+| `max_message_size` | 200 MiB | Largest PSRP message, and the most that is buffered for messages still incomplete (the default of PowerShell's `MaximumReceivedObjectSize`) |
+| `max_pipeline_size` | 1 GiB | Memory taken by the values one pipeline returns, all streams together, as the decoder estimates it (a value takes more room decoded than on the wire). A state message or a host call is bounded by the same figure, on its own |
+
+The defaults are generous; lower them to what you expect to read:
+
+```rust,ignore
+pool.set_receive_limits(
+    ReceiveLimits::default()
+        .with_max_message_size(16 << 20)
+        .with_max_pipeline_size(256 << 20),
+);
+```
+
+Passing a limit ends the read with `PsrpError::Fragment` or
+`PsrpError::Clixml`, after the server has been asked to stop the command.
+
 ## Roadmap
 
-| Version | Milestone | Status |
-|---|---|---|
-| **v1.0** | Full PSRP: CLIXML, fragments, runspace pool, pipeline builder, all 7 streams, typed records, host calls, session-key crypto, SSH transport, blocking API, shared pool, cancellation | **Current** |
-| **v1.x** | Pipeline input streaming, disconnect/reconnect pool, CLIXML `<Ref>` round-tripping | Planned |
+Everything under [Features](#features) is released; [CHANGELOG.md](CHANGELOG.md)
+has the detail per version. Pipeline input streaming and pool
+disconnect/reconnect, once listed here as planned, have shipped. Still open:
+
+| Item | Status |
+|---|---|
+| Host calls against a real server: the pool declares a null host, so PowerShell never calls the `PsHost` ([#52](https://github.com/muchiny/psrp-rs/issues/52)) | Planned |
+| CLIXML `<Ref>` round-tripping: the decoder resolves a `<Ref>` to a copy and the encoder writes every object in full, so shared identity is lost | Planned |
 
 ## Comparison
 
@@ -309,9 +364,9 @@ Set via `RunspacePool::open_with_options(transport, min, max)` or
 | Typed output | `PsValue` / `PsObject` | dict-based | `PSObject` |
 | All 7 streams | yes | yes | yes |
 | Pipeline builder | yes | yes | yes |
-| Host callbacks | pluggable `PsHost` trait | no | `PSHost` |
+| Host callbacks | `PsHost` trait (not called by a real server yet, [#52](https://github.com/muchiny/psrp-rs/issues/52)) | `PSHost` class | `PSHost` |
 | Session-key crypto | RSA + AES (pure Rust) | yes | built-in |
-| SSH transport | `russh` (feature-gated) | yes | built-in |
+| SSH transport | `russh` (feature-gated) | no (WSMan only) | built-in |
 | Auth methods | NTLMv2, Basic, Certificate (via winrm-rs); Kerberos with `winrm-rs`'s `kerberos` feature | NTLM, Basic, Kerberos, CredSSP | all |
 | TLS backend | rustls (`ring`, private to the client unless the application installed a provider) | OpenSSL | SChannel / OpenSSL |
 | Binary size | single static binary | interpreter | runtime |
@@ -323,8 +378,9 @@ Contributions are welcome. Please open an issue to discuss larger changes before
 
 ```sh
 cargo test --all-features      # unit + end-to-end tests (no network)
-cargo clippy --all-targets --all-features
+cargo clippy --all-targets --all-features -- -D warnings   # as CI: the hardened lints are warnings
 cargo fmt --all --check
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 cargo deny check               # advisories + licences
 MODE=smoke ./fuzz/run.sh       # quick pass over every fuzz target
 ```
@@ -344,6 +400,10 @@ following environment variables and use `--ignored`:
 | `PSRP_INTEGRATION_TLS` | no | off | `1` or `true` for HTTPS on 5986 (self-signed certificate accepted) |
 | `PSRP_INTEGRATION_PORT` | no | 5985, or 5986 with TLS | Port override |
 | `PSRP_INTEGRATION_AUTH` | no | NTLM | `basic` for Basic over plain HTTP, message encryption off |
+| `PSRP_INTEGRATION_SSH_HOST` | for the SSH tests | -- | Host with the `powershell` SSH subsystem; the SSH tests (built with `--features ssh`) do nothing without it |
+| `PSRP_INTEGRATION_SSH_PORT` | no | `22` | SSH port |
+| `PSRP_INTEGRATION_SSH_USER` | no | `vagrant` | SSH username |
+| `PSRP_INTEGRATION_SSH_PASS` | no | `vagrant` | SSH password |
 
 A [`Vagrantfile`](Vagrantfile) is provided to spin up a disposable Windows
 Server 2025 Hyper-V VM with WinRM + PSRP pre-configured:
@@ -356,6 +416,15 @@ PSRP_INTEGRATION_HOST=<ip> \
 PSRP_INTEGRATION_USER=vagrant \
 PSRP_INTEGRATION_PASS=vagrant \
   cargo test --test integration_real -- --ignored
+```
+
+The SSH tests need a host that serves the `powershell` subsystem (see
+[SSH transport](#ssh-transport)) and whose key is in `~/.ssh/known_hosts`;
+the Vagrant box does not set one up.
+
+```sh
+PSRP_INTEGRATION_SSH_HOST=<host> \
+  cargo test --features ssh --test integration_real -- --ignored live_ssh
 ```
 
 ## Fuzzing
@@ -372,7 +441,7 @@ SSH `known_hosts` matcher and the SSH OutOfProc line codec.
 rustup toolchain install nightly
 cargo install cargo-fuzz
 # CI pins the nightly (FUZZ_TOOLCHAIN in .github/workflows/fuzz.yml);
-# both scripts take the same variable, e.g. FUZZ_TOOLCHAIN=nightly-2026-10-30
+# both scripts take the same variable, e.g. FUZZ_TOOLCHAIN=nightly-2026-11-05
 
 ./fuzz/run.sh                           # every target, 60s each
 DURATION=900 ./fuzz/run.sh              # 15 minutes per target
@@ -387,11 +456,11 @@ fixed point, a closed or broken runspace pool must never return to `Opened`,
 and decrypting with the wrong session key must never yield the right
 plaintext.
 
-This work found and fixed seven defects, including two remote denials of
+This work found and fixed nine defects, including two remote denials of
 service. The CLIXML parser was recursive with no depth limit, so about 10 KiB
 of nested `<Obj>` from a hostile server overflowed the stack and aborted the
 process — parsing depth is now capped by
-[`MAX_NESTING_DEPTH`](https://docs.rs/psrp-rs/latest/psrp_rs/constant.MAX_NESTING_DEPTH.html).
+[`MAX_NESTING_DEPTH`](https://docs.rs/psrp-rs/latest/psrp_rs/clixml/constant.MAX_NESTING_DEPTH.html).
 And the SSH `known_hosts` glob matcher backtracked exponentially, so a pattern
 such as `*a*a*a*a*b` against a long hostname hung host-key verification
 itself; it is now an iterative `O(n*m)` matcher.
@@ -400,7 +469,7 @@ itself; it is now an iterative `O(n*m)` matcher.
 
 | Feature | Default | Description |
 |---|---|---|
-| *(default)* | -- | WinRM transport with NTLMv2/Basic/Certificate auth (via winrm-rs). For Kerberos, also depend on `winrm-rs = { version = "2", features = ["kerberos"] }` |
+| *(default)* | -- | WinRM transport with NTLMv2/Basic/Certificate auth (via winrm-rs). For Kerberos, also depend on `winrm-rs = { version = "3", features = ["kerberos"] }` |
 | `ssh` | no | SSH transport via `russh`, speaking PowerShell's out-of-process protocol (`pwsh -sshs`, PowerShell 7+) |
 | `serde` | no | `Serialize`/`Deserialize` derives on `PsValue` / `PsObject` |
 

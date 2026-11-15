@@ -35,8 +35,8 @@
 use std::env;
 
 use psrp_rs::{
-    AuthMethod, Command, EncryptionMode, Pipeline, PipelineState, PsValue, RunspacePool,
-    WinrmClient, WinrmConfig, WinrmCredentials, WinrmPsrpTransport,
+    AuthMethod, Command, EncryptionMode, Pipeline, PipelineState, PsValue, ReceiveLimits,
+    RunspacePool, WinrmClient, WinrmConfig, WinrmCredentials, WinrmPsrpTransport,
 };
 
 struct LiveConfig {
@@ -71,8 +71,8 @@ impl LiveConfig {
 
 fn build_client(cfg: &LiveConfig) -> WinrmClient {
     // NTLM by default, over HTTP and HTTPS: it seals the messages on plain
-    // HTTP. `PSRP_INTEGRATION_AUTH=basic` opts into Basic, which winrm-rs 2
-    // only accepts over HTTP with message encryption off
+    // HTTP. `PSRP_INTEGRATION_AUTH=basic` opts into Basic, which winrm-rs
+    // (from 2.0) only accepts over HTTP with message encryption off
     // (`EncryptionMode::Never`: the password and every SOAP body then cross
     // in clear), and refuses over HTTPS with `accept_invalid_certs`.
     let basic = match std::env::var("PSRP_INTEGRATION_AUTH").ok() {
@@ -83,7 +83,7 @@ fn build_client(cfg: &LiveConfig) -> WinrmClient {
     };
     assert!(
         !(basic && cfg.tls),
-        "PSRP_INTEGRATION_AUTH=basic with PSRP_INTEGRATION_TLS: winrm-rs 2 refuses Basic \
+        "PSRP_INTEGRATION_AUTH=basic with PSRP_INTEGRATION_TLS: winrm-rs refuses Basic \
          with accept_invalid_certs (the eval box's certificate is self-signed); use NTLM"
     );
     let (auth_method, encryption) = if basic {
@@ -311,14 +311,15 @@ async fn secure_string_round_trip<T: psrp_rs::PsrpTransport>(pool: &mut Runspace
 
     // One block, several blocks with a character outside the BMP, and the
     // empty string (one block of padding; `ConvertTo-SecureString` refuses
-    // an empty string, hence the constructor).
+    // an empty string, hence the constructor). `New-Object`, not `::new`:
+    // the scripts must run on PowerShell 4 (Windows Server 2012 R2) too.
     for (secret, make) in [
         ("p@ss", "ConvertTo-SecureString 'p@ss' -AsPlainText -Force"),
         (
             "héllo 🌍 world, long secret",
             "ConvertTo-SecureString 'héllo 🌍 world, long secret' -AsPlainText -Force",
         ),
-        ("", "[securestring]::new()"),
+        ("", "New-Object securestring"),
     ] {
         // Server -> client: PowerShell encrypts the SecureString it outputs.
         let out = pool.run_script(make).await.expect("run_script");
@@ -335,8 +336,10 @@ async fn secure_string_round_trip<T: psrp_rs::PsrpTransport>(pool: &mut Runspace
         let sealed = pool.encrypt_secure_string(secret).expect("encrypt");
         let result = Pipeline::empty()
             .add_command(
-                Command::script("param($s) [System.Net.NetworkCredential]::new('', $s).Password")
-                    .with_parameter("s", PsValue::SecureString(sealed)),
+                Command::script(
+                    "param($s) (New-Object System.Net.NetworkCredential('', $s)).Password",
+                )
+                .with_parameter("s", PsValue::SecureString(sealed)),
             )
             .run_all_streams(pool)
             .await
@@ -420,7 +423,7 @@ async fn live_char_surrogates_and_non_bmp() {
     let mut pool = open_pool(&client, &cfg.host).await;
 
     let out = pool
-        .run_script("([string]::new([char[]](0xD83D,0xDE00))).ToCharArray()")
+        .run_script("(-join [char[]](0xD83D,0xDE00)).ToCharArray()")
         .await
         .expect("a surrogate half must not fail the pipeline");
     assert_eq!(
@@ -543,6 +546,168 @@ async fn live_winrm_cancel_then_reuse() {
         let out = pool.run_script("7").await.expect("pool reusable");
         assert_eq!(out, vec![PsValue::I32(7)]);
     }
+
+    let _ = pool.close().await;
+}
+
+/// Output in bulk, as a real server frames it: one string of several
+/// megabytes (hundreds of fragments, over many Receive responses) and twenty
+/// thousand small objects (many messages per response). Both must come back
+/// whole, and the pool must take another pipeline afterwards.
+#[tokio::test]
+#[ignore = "requires PSRP_INTEGRATION_HOST"]
+async fn live_winrm_large_output() {
+    let Some(cfg) = LiveConfig::from_env() else {
+        return;
+    };
+    let client = build_client(&cfg);
+    let mut pool = open_pool(&client, &cfg.host).await;
+
+    let out = pool
+        .run_script("'x' * 3000000")
+        .await
+        .expect("one large string");
+    let [PsValue::String(text)] = out.as_slice() else {
+        panic!("expected one string, got {} values", out.len());
+    };
+    assert_eq!(text.len(), 3_000_000);
+    assert!(text.bytes().all(|b| b == b'x'));
+
+    let out = pool
+        .run_script("1..20000")
+        .await
+        .expect("many small objects");
+    assert_eq!(out.len(), 20_000);
+    let sum: i64 = out
+        .iter()
+        .map(|v| i64::from(v.as_i32().expect("an Int32")))
+        .sum();
+    assert_eq!(sum, 200_010_000);
+
+    let out = pool.run_script("7").await.expect("pool reusable");
+    assert_eq!(out, vec![PsValue::I32(7)]);
+
+    let _ = pool.close().await;
+}
+
+/// `ReceiveLimits::max_pipeline_size` against a command whose output never
+/// ends: the read is given up with an error, the command is stopped on the
+/// server and the pool takes the next pipeline. The pool has a single
+/// runspace: a command left running would keep it, and the pipeline after it
+/// would wait for it.
+#[tokio::test]
+#[ignore = "requires PSRP_INTEGRATION_HOST"]
+async fn live_winrm_pipeline_over_the_limit_is_stopped() {
+    let Some(cfg) = LiveConfig::from_env() else {
+        return;
+    };
+    let client = build_client(&cfg);
+    let mut pool = open_pool(&client, &cfg.host).await;
+
+    pool.set_receive_limits(ReceiveLimits::default().with_max_pipeline_size(256 * 1024));
+    let err = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        pool.run_script("while ($true) { 'x' * 1000 }"),
+    )
+    .await
+    .expect("the limit must end the read")
+    .expect_err("the output never ends");
+    assert!(
+        matches!(&err, psrp_rs::PsrpError::Clixml(m) if m.contains("262144-byte limit")),
+        "{err:?}"
+    );
+
+    pool.set_receive_limits(ReceiveLimits::default());
+    let out = tokio::time::timeout(std::time::Duration::from_secs(30), pool.run_script("7"))
+        .await
+        .expect("the runspace must be free again")
+        .expect("pool reusable");
+    assert_eq!(out, vec![PsValue::I32(7)]);
+
+    let _ = pool.close().await;
+}
+
+/// `ReceiveLimits::max_message_size` against one object larger than it: the
+/// message is refused while it is reassembled, the command is stopped, and
+/// the same pool reads the same object once the limit allows it (what the
+/// reassembler held of the refused message must not leak into the next
+/// pipeline's stream).
+#[tokio::test]
+#[ignore = "requires PSRP_INTEGRATION_HOST"]
+async fn live_winrm_message_over_the_limit_is_refused() {
+    let Some(cfg) = LiveConfig::from_env() else {
+        return;
+    };
+    let client = build_client(&cfg);
+    let mut pool = open_pool(&client, &cfg.host).await;
+
+    pool.set_receive_limits(ReceiveLimits::default().with_max_message_size(64 * 1024));
+    let err = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        pool.run_script("'x' * 500000"),
+    )
+    .await
+    .expect("the limit must end the read")
+    .expect_err("a 500 kB object does not fit in 64 KiB");
+    assert!(
+        matches!(&err, psrp_rs::PsrpError::Fragment(m) if m.contains("message limit")),
+        "{err:?}"
+    );
+
+    pool.set_receive_limits(ReceiveLimits::default());
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        pool.run_script("'x' * 500000"),
+    )
+    .await
+    .expect("the runspace must be free again")
+    .expect("the same object under the default limit");
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].as_str().map(str::len), Some(500_000));
+
+    let _ = pool.close().await;
+}
+
+/// `GetCommandMetadata` over WinRM: only the answers to this request are
+/// read (pipeline and pool ids), and the pool runs pipelines and another
+/// request afterwards.
+#[tokio::test]
+#[ignore = "requires PSRP_INTEGRATION_HOST"]
+async fn live_winrm_command_metadata() {
+    let Some(cfg) = LiveConfig::from_env() else {
+        return;
+    };
+    let client = build_client(&cfg);
+    let mut pool = open_pool(&client, &cfg.host).await;
+
+    let meta = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        pool.get_command_metadata(&["Get-Date"], psrp_rs::CommandType::CMDLET),
+    )
+    .await
+    .expect("the request must be answered")
+    .expect("get_command_metadata");
+    assert!(
+        meta.iter().any(|m| m.name == "Get-Date"),
+        "Get-Date not in the metadata list: {meta:?}"
+    );
+
+    let out = pool.run_script("7").await.expect("pool reusable");
+    assert_eq!(out, vec![PsValue::I32(7)]);
+
+    let meta = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        pool.get_command_metadata(&["Get-Item", "Get-ChildItem"], psrp_rs::CommandType::CMDLET),
+    )
+    .await
+    .expect("the second request must be answered")
+    .expect("get_command_metadata after a pipeline");
+    for name in ["Get-Item", "Get-ChildItem"] {
+        assert!(meta.iter().any(|m| m.name == name), "{name}: {meta:?}");
+    }
+
+    let out = pool.run_script("8").await.expect("pool reusable");
+    assert_eq!(out, vec![PsValue::I32(8)]);
 
     let _ = pool.close().await;
 }

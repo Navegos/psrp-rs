@@ -22,11 +22,13 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # Dated nightly, not the floating one: nightly-2026-11-01 (rustc f9ceb4a4d,
-  # 2026-10-31) fails to compile russh with "cycle detected when computing
+  # Dated nightly, not the floating one, so that a nightly regression cannot
+  # stop the fuzz jobs unannounced: nightly-2026-11-01 (rustc f9ceb4a4d,
+  # 2026-10-31) failed to compile russh with "cycle detected when computing
   # when ssh_key::public::key_data::KeyData needs async drop"
-  # (rust-lang/rust#165263). Raise it once that issue is fixed.
-  FUZZ_TOOLCHAIN: nightly-2026-10-30
+  # (rust-lang/rust#165263, reverted by #165266). Raise the date on purpose,
+  # once `cargo fuzz build` passes on the new one.
+  FUZZ_TOOLCHAIN: nightly-2026-11-05
 
 jobs:
   build:
@@ -45,8 +47,11 @@ jobs:
       - run: cargo install cargo-fuzz --locked
       - run: cargo +${{ env.FUZZ_TOOLCHAIN }} fuzz build
       # The seed corpus is generated from the crate's own encoders, so a
-      # wire-format change must regenerate it.
-      - run: cargo run --example generate_fuzz_corpus
+      # wire-format change must regenerate it. With the fuzz toolchain, the
+      # only one this job installs: `rust-toolchain.toml` asks for `stable`,
+      # and the one the runner comes with can be older than the MSRV (1.99.1
+      # when `winrm-rs` 3 raised it to 1.100).
+      - run: cargo +${{ env.FUZZ_TOOLCHAIN }} run --example generate_fuzz_corpus
       # `git diff` ignores untracked files and the generator starts from an
       # empty `fuzz/seeds`, so `git status` is what sees a seed that was
       # added, changed or removed.

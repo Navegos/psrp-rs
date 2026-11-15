@@ -53,9 +53,8 @@ impl Destination {
 
 /// MS-PSRP message type codes (§2.2.2.1).
 ///
-/// Only the types needed for the P0/P1 scope are enumerated. Unknown codes
-/// decode to [`MessageType::Unknown`] so callers can still inspect the raw
-/// value for diagnostic purposes.
+/// A code that is not listed here decodes to [`MessageType::Unknown`], so
+/// callers can still inspect the raw value for diagnostic purposes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageType {
     SessionCapability,

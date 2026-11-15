@@ -9,7 +9,12 @@
 //! The [`PsHost`] trait is the contract. Implement it to customise the
 //! host behaviour. The default [`NoInteractionHost`] rejects every
 //! interactive call with an error — good enough for non-interactive
-//! automation and never hangs.
+//! automation, and the remote script does not wait: a method that returns a
+//! value is always answered, with that value or with the error.
+//!
+//! The method numbers are those of MS-PSRP 2.2.3.17 (`RemoteHostMethodId`),
+//! see [`HostMethodId`]. That table also says which methods return
+//! nothing: the client must not answer those, and must answer the others.
 
 use async_trait::async_trait;
 
@@ -216,10 +221,33 @@ impl PsHost for BufferedHost {
     }
 }
 
-/// MS-PSRP §2.2.6 — host method identifiers we care about.
+/// MS-PSRP 2.2.3.17 — the host methods a [`PsHost`] can answer.
 ///
-/// Only a subset is enumerated; unknown ids decode to
-/// [`HostMethodId::Other`] and are rejected by default.
+/// Only a subset of the 56 methods has a variant. The others decode to
+/// [`HostMethodId::Other`]: those the table gives a return value are
+/// rejected with an error response, those it gives none are ignored and
+/// left unanswered, as the protocol requires ([`is_void`](Self::is_void)).
+/// Three of them are still served: `Write1` (13) and `Write2` (14) go to
+/// [`PsHost::write`], and `PromptForCredential2` (25) to
+/// [`PsHost::get_credential`] like `PromptForCredential1`
+/// ([`HostMethodId::PromptForCredential`], 24).
+///
+/// Wire values (`from_i64` / `to_i64`):
+///
+/// | Id | Variant | Id | Variant |
+/// |---|---|---|---|
+/// | 11 | `ReadLine` | 20 | `WriteProgress` |
+/// | 12 | `ReadLineAsSecureString` | 21 | `WriteVerboseLine` |
+/// | 15 | `WriteLine1` | 22 | `WriteWarningLine` |
+/// | 16 | `WriteLine2` | 23 | `Prompt` |
+/// | 17 | `WriteLine3` | 24 | `PromptForCredential` |
+/// | 18 | `WriteErrorLine` | 26 | `PromptForChoice` |
+/// | 19 | `WriteDebugLine` | | |
+///
+/// Up to 4.0.0 these were numbered 11 to 18 for the writes and 51 to 56 for
+/// the reads, which is no version of the protocol: a real server's
+/// `Read-Host` (11) would have been taken for a write and never answered,
+/// and its `Write-Host` (16) for a progress record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostMethodId {
     WriteLine1,
@@ -243,19 +271,19 @@ impl HostMethodId {
     #[must_use]
     pub fn from_i64(v: i64) -> Self {
         match v {
-            11 => Self::WriteLine1,
-            12 => Self::WriteLine2,
-            13 => Self::WriteLine3,
-            14 => Self::WriteErrorLine,
-            15 => Self::WriteDebugLine,
-            16 => Self::WriteProgress,
-            17 => Self::WriteVerboseLine,
-            18 => Self::WriteWarningLine,
-            51 => Self::ReadLine,
-            52 => Self::ReadLineAsSecureString,
-            53 => Self::Prompt,
-            54 => Self::PromptForCredential,
-            56 => Self::PromptForChoice,
+            11 => Self::ReadLine,
+            12 => Self::ReadLineAsSecureString,
+            15 => Self::WriteLine1,
+            16 => Self::WriteLine2,
+            17 => Self::WriteLine3,
+            18 => Self::WriteErrorLine,
+            19 => Self::WriteDebugLine,
+            20 => Self::WriteProgress,
+            21 => Self::WriteVerboseLine,
+            22 => Self::WriteWarningLine,
+            23 => Self::Prompt,
+            24 => Self::PromptForCredential,
+            26 => Self::PromptForChoice,
             other => Self::Other(other),
         }
     }
@@ -264,19 +292,19 @@ impl HostMethodId {
     #[must_use]
     pub fn to_i64(self) -> i64 {
         match self {
-            Self::WriteLine1 => 11,
-            Self::WriteLine2 => 12,
-            Self::WriteLine3 => 13,
-            Self::WriteErrorLine => 14,
-            Self::WriteDebugLine => 15,
-            Self::WriteProgress => 16,
-            Self::WriteVerboseLine => 17,
-            Self::WriteWarningLine => 18,
-            Self::ReadLine => 51,
-            Self::ReadLineAsSecureString => 52,
-            Self::Prompt => 53,
-            Self::PromptForCredential => 54,
-            Self::PromptForChoice => 56,
+            Self::ReadLine => 11,
+            Self::ReadLineAsSecureString => 12,
+            Self::WriteLine1 => 15,
+            Self::WriteLine2 => 16,
+            Self::WriteLine3 => 17,
+            Self::WriteErrorLine => 18,
+            Self::WriteDebugLine => 19,
+            Self::WriteProgress => 20,
+            Self::WriteVerboseLine => 21,
+            Self::WriteWarningLine => 22,
+            Self::Prompt => 23,
+            Self::PromptForCredential => 24,
+            Self::PromptForChoice => 26,
             Self::Other(v) => v,
         }
     }
@@ -295,23 +323,38 @@ impl HostMethodId {
         }
     }
 
-    /// True for write-only host methods (fire-and-forget, no response
-    /// required by the protocol).
+    /// True for the methods that return nothing in the table of MS-PSRP
+    /// 2.2.3.17, whether they have a variant or not: the client MUST NOT
+    /// answer those, and MUST answer every other one, or the remote script
+    /// waits for ever.
     #[must_use]
     pub fn is_void(self) -> bool {
         matches!(
-            self,
-            Self::WriteLine1
-                | Self::WriteLine2
-                | Self::WriteLine3
-                | Self::WriteErrorLine
-                | Self::WriteWarningLine
-                | Self::WriteVerboseLine
-                | Self::WriteDebugLine
-                | Self::WriteProgress
+            self.to_i64(),
+            // SetShouldExit, Enter/ExitNestedPrompt, NotifyBegin/EndApplication.
+            6..=10
+            // Write1, Write2, WriteLine1-3, WriteErrorLine, WriteDebugLine,
+            // WriteProgress, WriteVerboseLine, WriteWarningLine.
+            | 13..=22
+            // The setters of the raw UI: foreground and background colour,
+            // cursor position, window position, cursor size, buffer size,
+            // window size, window title.
+            | 28 | 30 | 32 | 34 | 36 | 38 | 40 | 42
+            // FlushInputBuffer, SetBufferContents1-2.
+            | 47..=49
+            // ScrollBufferContents, PushRunspace, PopRunspace.
+            | 51..=53
         )
     }
 }
+
+/// `Write1(value)` and `Write2(foreground, background, value)`: they have no
+/// variant (adding one would break exhaustive matches on [`HostMethodId`]).
+const WRITE1: i64 = 13;
+const WRITE2: i64 = 14;
+/// `PromptForCredential2`: the first four parameters of
+/// `PromptForCredential1`, then the credential types and options.
+const PROMPT_FOR_CREDENTIAL2: i64 = 25;
 
 /// Dispatch a host method call to a [`PsHost`] implementation.
 ///
@@ -335,6 +378,7 @@ pub async fn dispatch_host_call(
             HostMethodId::WriteLine1 | HostMethodId::WriteLine2 | HostMethodId::WriteLine3 => {
                 host.write_line(&text).await;
             }
+            HostMethodId::Other(WRITE1 | WRITE2) => host.write(&text).await,
             HostMethodId::WriteErrorLine => host.write_error_line(&text).await,
             HostMethodId::WriteWarningLine => host.write_warning_line(&text).await,
             HostMethodId::WriteVerboseLine => host.write_verbose_line(&text).await,
@@ -344,6 +388,9 @@ pub async fn dispatch_host_call(
                 let record = mp.get(1).cloned().unwrap_or(PsValue::Null);
                 host.write_progress(source_id, record).await;
             }
+            // The other methods that return nothing (`SetShouldExit`,
+            // `SetCursorPosition`, ...): nothing a `PsHost` can be told, and
+            // no answer to send.
             _ => {}
         }
         return Ok(None);
@@ -398,7 +445,7 @@ pub async fn dispatch_host_call(
             let out = host.prompt(caption, message, &fields).await?;
             Ok(Some(PsValue::List(out)))
         }
-        HostMethodId::PromptForCredential => {
+        HostMethodId::PromptForCredential | HostMethodId::Other(PROMPT_FOR_CREDENTIAL2) => {
             let caption = mp.first().and_then(PsValue::as_str).unwrap_or_default();
             let message = mp.get(1).and_then(PsValue::as_str).unwrap_or_default();
             let user = mp.get(2).and_then(PsValue::as_str).unwrap_or_default();
@@ -516,10 +563,10 @@ mod tests {
     #[test]
     fn host_method_id_roundtrip() {
         for (n, expected) in [
-            (11i64, HostMethodId::WriteLine1),
-            (14, HostMethodId::WriteErrorLine),
-            (51, HostMethodId::ReadLine),
-            (56, HostMethodId::PromptForChoice),
+            (15i64, HostMethodId::WriteLine1),
+            (18, HostMethodId::WriteErrorLine),
+            (11, HostMethodId::ReadLine),
+            (26, HostMethodId::PromptForChoice),
             (999, HostMethodId::Other(999)),
         ] {
             let id = HostMethodId::from_i64(n);
@@ -534,6 +581,196 @@ mod tests {
         assert!(HostMethodId::WriteProgress.is_void());
         assert!(!HostMethodId::ReadLine.is_void());
         assert!(!HostMethodId::PromptForChoice.is_void());
+    }
+
+    /// The table of MS-PSRP 2.2.3.17, whole: the name of each method and
+    /// whether it returns a value. `None` in the middle column: the method
+    /// has no variant and decodes to `Other`.
+    #[rustfmt::skip]
+    const SPEC_TABLE: [(i64, Option<HostMethodId>, &str, bool); 56] = [
+        (1, None, "GetName", true),
+        (2, None, "GetVersion", true),
+        (3, None, "GetInstanceId", true),
+        (4, None, "GetCurrentCulture", true),
+        (5, None, "GetCurrentUICulture", true),
+        (6, None, "SetShouldExit", false),
+        (7, None, "EnterNestedPrompt", false),
+        (8, None, "ExitNestedPrompt", false),
+        (9, None, "NotifyBeginApplication", false),
+        (10, None, "NotifyEndApplication", false),
+        (11, Some(HostMethodId::ReadLine), "ReadLine", true),
+        (12, Some(HostMethodId::ReadLineAsSecureString), "ReadLineAsSecureString", true),
+        (13, None, "Write1", false),
+        (14, None, "Write2", false),
+        (15, Some(HostMethodId::WriteLine1), "WriteLine1", false),
+        (16, Some(HostMethodId::WriteLine2), "WriteLine2", false),
+        (17, Some(HostMethodId::WriteLine3), "WriteLine3", false),
+        (18, Some(HostMethodId::WriteErrorLine), "WriteErrorLine", false),
+        (19, Some(HostMethodId::WriteDebugLine), "WriteDebugLine", false),
+        (20, Some(HostMethodId::WriteProgress), "WriteProgress", false),
+        (21, Some(HostMethodId::WriteVerboseLine), "WriteVerboseLine", false),
+        (22, Some(HostMethodId::WriteWarningLine), "WriteWarningLine", false),
+        (23, Some(HostMethodId::Prompt), "Prompt", true),
+        (24, Some(HostMethodId::PromptForCredential), "PromptForCredential1", true),
+        (25, None, "PromptForCredential2", true),
+        (26, Some(HostMethodId::PromptForChoice), "PromptForChoice", true),
+        (27, None, "GetForegroundColor", true),
+        (28, None, "SetForegroundColor", false),
+        (29, None, "GetBackgroundColor", true),
+        (30, None, "SetBackgroundColor", false),
+        (31, None, "GetCursorPosition", true),
+        (32, None, "SetCursorPosition", false),
+        (33, None, "GetWindowPosition", true),
+        (34, None, "SetWindowPosition", false),
+        (35, None, "GetCursorSize", true),
+        (36, None, "SetCursorSize", false),
+        (37, None, "GetBufferSize", true),
+        (38, None, "SetBufferSize", false),
+        (39, None, "GetWindowSize", true),
+        (40, None, "SetWindowSize", false),
+        (41, None, "GetWindowTitle", true),
+        (42, None, "SetWindowTitle", false),
+        (43, None, "GetMaxWindowSize", true),
+        (44, None, "GetMaxPhysicalWindowSize", true),
+        (45, None, "GetKeyAvailable", true),
+        (46, None, "ReadKey", true),
+        (47, None, "FlushInputBuffer", false),
+        (48, None, "SetBufferContents1", false),
+        (49, None, "SetBufferContents2", false),
+        (50, None, "GetBufferContents", true),
+        (51, None, "ScrollBufferContents", false),
+        (52, None, "PushRunspace", false),
+        (53, None, "PopRunspace", false),
+        (54, None, "GetIsRunspacePushed", true),
+        (55, None, "GetRunspace", true),
+        (56, None, "PromptForChoiceMultipleSelection", true),
+    ];
+
+    /// Regression: the ids were 11 to 18 for the writes and 51 to 56 for the
+    /// reads, numbers of no version of the protocol. Every id of the table
+    /// decodes to its method, encodes back to itself, and is void exactly
+    /// when the table gives it no return value.
+    #[test]
+    fn host_method_ids_follow_ms_psrp_2_2_3_17() {
+        for (n, (id, variant, name, returns)) in (1i64..).zip(SPEC_TABLE) {
+            assert_eq!(id, n, "the table lists every id once, in order");
+            let decoded = HostMethodId::from_i64(id);
+            assert_eq!(
+                decoded,
+                variant.unwrap_or(HostMethodId::Other(id)),
+                "{name}"
+            );
+            assert_eq!(decoded.to_i64(), id, "{name}");
+            assert_eq!(decoded.is_void(), !returns, "{name} ({id})");
+            if let Some(variant) = variant {
+                // The variant is named after the method (`PromptForCredential`
+                // serves `PromptForCredential1`).
+                assert!(name.starts_with(&format!("{variant:?}")), "{name}");
+            }
+        }
+        // Outside the table: unknown, so answered (with an error).
+        for id in [i64::MIN, -1, 0, 57, 999, i64::MAX] {
+            let decoded = HostMethodId::from_i64(id);
+            assert_eq!(decoded, HostMethodId::Other(id));
+            assert_eq!(decoded.to_i64(), id);
+            assert!(!decoded.is_void(), "{id}");
+        }
+    }
+
+    /// Every method of the table gets what the protocol requires from the
+    /// default host: no answer when it returns nothing, an answer (here the
+    /// rejection) when it returns a value, so the remote script never waits.
+    #[tokio::test]
+    async fn every_method_is_answered_exactly_when_it_returns_a_value() {
+        for (id, _, name, returns) in SPEC_TABLE {
+            let out = dispatch_host_call(&NoInteractionHost, HostMethodId::from_i64(id), &[]).await;
+            if returns {
+                assert!(
+                    matches!(out, Err(PsrpError::Protocol(_))),
+                    "{name}: {out:?}"
+                );
+            } else {
+                assert_eq!(out.unwrap(), None, "{name}");
+            }
+        }
+    }
+
+    /// `Write1` and `Write2` have no variant but reach `PsHost::write`; the
+    /// colours of `Write2` are not text.
+    #[tokio::test]
+    async fn write1_and_write2_reach_the_host() {
+        let h = BufferedHost::new();
+        let out = dispatch_host_call(
+            &h,
+            HostMethodId::from_i64(13),
+            &[PsValue::String("a".into())],
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, None);
+        dispatch_host_call(
+            &h,
+            HostMethodId::from_i64(14),
+            &[
+                PsValue::I32(7),
+                PsValue::I32(0),
+                PsValue::String("b".into()),
+            ],
+        )
+        .await
+        .unwrap();
+        // A void method that is not a write tells the host nothing.
+        dispatch_host_call(
+            &h,
+            HostMethodId::from_i64(6),
+            &[PsValue::String("c".into())],
+        )
+        .await
+        .unwrap();
+        // `BufferedHost` keeps `write` and `write_line` in the same buffer.
+        assert_eq!(h.lines(), vec!["a".to_string(), "b".to_string()]);
+    }
+
+    /// `PromptForCredential2` is served like `PromptForCredential1`.
+    #[tokio::test]
+    async fn prompt_for_credential2_reaches_get_credential() {
+        struct Creds;
+        #[async_trait]
+        impl PsHost for Creds {
+            async fn get_credential(
+                &self,
+                caption: &str,
+                message: &str,
+                user: &str,
+            ) -> Result<(String, String)> {
+                Ok((format!("{caption}/{message}/{user}"), "pw".into()))
+            }
+        }
+        let mp = [
+            PsValue::String("cap".into()),
+            PsValue::String("msg".into()),
+            PsValue::String("bob".into()),
+            PsValue::String("target".into()),
+            PsValue::I32(1),
+            PsValue::I32(0),
+        ];
+        for id in [24, 25] {
+            let out = dispatch_host_call(&Creds, HostMethodId::from_i64(id), &mp)
+                .await
+                .unwrap()
+                .unwrap();
+            let obj = out.properties().unwrap();
+            assert_eq!(
+                obj.get("UserName"),
+                Some(&PsValue::String("cap/msg/bob".into())),
+                "{id}"
+            );
+            assert_eq!(
+                obj.get("Password"),
+                Some(&PsValue::SecureString("pw".into())),
+                "{id}"
+            );
+        }
     }
 
     // ---------- Phase D: dispatch coverage ----------

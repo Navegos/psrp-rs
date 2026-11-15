@@ -11,7 +11,7 @@
 #   MODE=list ./fuzz/run.sh             # print the target list and exit
 #   SANITIZER=none ./fuzz/run.sh        # no ASan (much faster, less coverage)
 #   VALUE_PROFILE=0 ./fuzz/run.sh       # disable value profiling
-#   FUZZ_TOOLCHAIN=nightly-2026-10-30 ./fuzz/run.sh   # pin the nightly (CI does)
+#   FUZZ_TOOLCHAIN=nightly-2026-11-05 ./fuzz/run.sh   # pin the nightly (CI does)
 #
 # Targets are discovered from `cargo fuzz list`, so adding a `[[bin]]` to
 # fuzz/Cargo.toml is enough — this script needs no edit.

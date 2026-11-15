@@ -592,7 +592,11 @@ mod tests {
         let msg = PsrpMessage::decode(&messages[0])?;
         assert_eq!(msg.message_type, MessageType::PipelineState);
         assert_eq!(msg.pid, P1);
-        assert_eq!(extract_pipeline_state(&msg.data)?, PipelineState::Stopped);
+        let budget = crate::clixml::decode::DecodeBudget::default();
+        assert_eq!(
+            extract_pipeline_state(&msg.data, &budget)?,
+            PipelineState::Stopped
+        );
         assert!(h.violations().is_empty(), "{:?}", h.violations());
         Ok(())
     }

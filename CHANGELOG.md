@@ -6,6 +6,258 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+`winrm-rs` 3.0.0 or later is now required. The `AuthMethod`,
+`EncryptionMode`, `WinrmClient`, `WinrmConfig`, `WinrmCredentials` and
+`WinrmError` that psrp-rs re-exports are the `winrm-rs` 3 types, so the
+release that carries this is a major one. Read *Upgrading from 4.x* first,
+then the *Upgrading from 2.x* section of the [`winrm-rs` 3.0.0
+changelog](https://github.com/muchiny/winrm-rs/blob/main/CHANGELOG.md).
+
+### Upgrading from 4.x
+
+- A crate that imports `winrm_rs` itself must depend on `winrm-rs = "3"`;
+  with `"2"` it gets a second, distinct `WinrmClient` that
+  `WinrmPsrpTransport::open` does not take.
+- `WinrmError`, which `PsrpError::Winrm` holds, says what failed by its
+  variant, and `WinrmError::AuthFailed` is gone. What it was for a psrp-rs
+  caller is now: `AuthRejected` for credentials or a method the server
+  refused (HTTP 401); `Config` for a client that cannot be built as
+  configured (Basic over plain HTTP without `EncryptionMode::Never`, ...)
+  and for a host that is not bare and canonical, both before any request;
+  `HttpStatus { status, .. }` for an HTTP status that is neither a SOAP
+  fault nor a 401; `Connection` for an authenticated connection the server
+  closed; `Authentication`, `Protocol` and `Internal` for the rest. The
+  `winrm-rs` changelog has the table. Code that only shows the error or
+  passes it on with `?` compiles as it is; code that matched `AuthFailed`
+  no longer compiles, which shows each place that has to choose.
+- `WinrmError`, `AuthMethod` and `EncryptionMode` are `#[non_exhaustive]`:
+  a `match` on one of them needs a wildcard arm. So is the
+  `SoapError::Fault` variant: a pattern on it ends with `..`, and only
+  `winrm-rs` can build one. A test that handed one to its own code has to
+  get it from a server's answer read by a `WinrmClient`.
+- The messages follow the variants (`WinRM authentication rejected: …`,
+  `WinRM configuration error: …`), and no `winrm-rs` error has a
+  `source()`: what it wraps is in its message. Match the variant, not the
+  text.
+- Rust 1.100 is required.
+
+### Added
+
+- **`ReceiveLimits`**, with `RunspacePool::receive_limits` and
+  `set_receive_limits`: how much a pool accepts from the server before it
+  gives up. `max_message_size` (default 200 MiB, the default of PowerShell's
+  own `MaximumReceivedObjectSize`) bounds one PSRP message and what is
+  buffered for the messages still incomplete; `max_pipeline_size` (default
+  1 GiB) bounds the memory taken by the values one pipeline returns, all
+  streams together. A `DisconnectedPool` keeps them across a reconnect. See
+  *Security* below.
+- `Reassembler::with_max_message_size`, `max_message_size`,
+  `set_max_message_size` and `clear`, and the constants
+  `fragment::DEFAULT_MAX_MESSAGE_SIZE` and `clixml::DEFAULT_MAX_DECODED_SIZE`.
+- `PsrpTransport::pipeline_has_its_own_stream`, false by default and true
+  for `WinrmPsrpTransport`: whether the bytes read after `execute_pipeline`
+  come from a stream of their own. A transport that wraps another one must
+  forward it, like `send_pipeline_fragment`.
+- `PsrpTransport::abandon_pipeline`, which does nothing by default: the pool
+  calls it when the reader of a pipeline gives up before its end, after the
+  stop signal. `WinrmPsrpTransport` uses it to read the stopped command to
+  its end (see *Fixed*). A transport that wraps another one must forward it.
+
+### Changed
+
+- **`winrm-rs` 3.0.0 is required** (from `"2.0.1"`), **and the MSRV is
+  1.100** (from 1.98), which `winrm-rs` 3.0 needs. `winrm-rs` ships security
+  fixes for its latest minor only, so its 2.x line gets none any more. See
+  *Upgrading from 4.x* for what the new major changes in the types psrp-rs
+  re-exports. psrp-rs itself changes one thing for it: a SOAP fault that
+  ends a Receive is passed on as `winrm-rs` returned it, where it was
+  rebuilt from its code and reason.
+- **What a pool inherits from `winrm-rs` 3.0**, with no change in psrp-rs:
+  a server's SOAP answers are read with an XML parser, so an answer that
+  is not a well-formed document is refused (`SoapError::ParseError`) where
+  it was searched for tag-shaped text, and an id or a fault code is the
+  text XML decodes to. This holds for every operation: the answer to a
+  Send, a Signal, a Disconnect or a Delete was taken for a success when no
+  fault was found in it, and is now refused if it is not a document (the
+  server may still have carried the request out); a Create refused this
+  way leaves its shell on the host until the server ends it for being
+  idle. With NTLM or
+  Kerberos sealing, an error status the server did not seal (a 503 while
+  the WinRM service restarts) is `WinrmError::HttpStatus` with its status;
+  a pinned certificate that does not match is never retried. The NTLM
+  session key is read from the operating system's random source, which
+  keeps no state a later read of the process memory could recompute it
+  from. The full list is in the `winrm-rs` 3.0.0 changelog.
+
+- **A `Disconnected` pipeline is an error for the calls that return the
+  output alone.** `Pipeline::run`, `Pipeline::run_with_cancel` and
+  `RunspacePool::run_script` / `run_script_with_cancel` returned the output
+  read so far as if the pipeline had completed; they now fail with
+  `PsrpError::BadState { expected: "Completed", actual: "Disconnected" }`.
+  `run_all_streams*` and `PipelineHandle::collect*` still return `Ok`, with
+  `PipelineResult::state` saying `Disconnected`.
+- **`get_command_metadata` returns a list only for a pipeline that
+  completed.** `Stopped` is now `PsrpError::Stopped` and `Disconnected` a
+  `PsrpError::BadState`; both used to return the list read so far.
+- **`Debug` for `PsValue` no longer prints the content of a `SecureString`**:
+  it reads `SecureString(<redacted>)`. Every other variant prints as before.
+
+### Fixed
+
+- **docs.rs documents the `ssh` and `serde` features.** The pages were built
+  with the default features only, so the whole `psrp_rs::ssh` module
+  (`SshConfig`, `SshAuth`, `SshPsrpTransport`, the host-key policies) was
+  missing from them and the README link to it was dead.
+- **README and crate-level documentation brought back in line with the
+  code.** The roadmap still listed pipeline input streaming and
+  disconnect/reconnect as planned; both have shipped. The host-call feature
+  now says that a real server does not call a `PsHost` yet (#52). The
+  shared-pool example moved its handles into `tokio::spawn`, which does not
+  compile for a pool over WinRM (it borrows its `WinrmClient`); it now joins
+  them in one task and says when spawning works. The link to
+  `MAX_NESTING_DEPTH` was dead, the pypsrp column of the comparison was
+  wrong on host callbacks and SSH, and the SSH integration-test variables
+  were not listed.
+- **Stopping a pipeline that still has output to deliver, over WinRM.**
+  Windows answers the stop signal once the pipeline has stopped, and a
+  pipeline whose output is waiting for a Receive stops only when one takes
+  it. `WinrmPsrpTransport::signal_stop` waited for the answer without
+  reading: after `operation_timeout_secs` the server gave up, so
+  `run_with_cancel` on a command that was writing output (`while ($true) {
+  'x' }`) returned a `w:TimedOut` fault instead of `Cancelled`, 20 s late,
+  and the pool could not run another pipeline for about a minute (the old
+  one kept its runspace). The signal is now left in flight after 500 ms and
+  finished by the Receives that follow; measured against Windows Server 2025
+  and 2012 R2, the cancellation takes half a second and the next pipeline
+  starts at once. A failure of the signal that arrives while the pipeline is
+  still being read is the error of that read, as it was the error of the
+  cancellation: a refusal, or the server's `w:TimedOut` for a pipeline that
+  does not stop within `operation_timeout_secs` (a cmdlet that cannot be
+  interrupted), which is returned after the same delay as before.
+  When the reader leaves before the end (see *A command the client gives up
+  on is stopped* below), the stopped command is read to its end, for at most
+  5 s: at once when the reader gives up on a message, before the next
+  command starts when it was dropped.
+- **`get_command_metadata` works over WinRM.** `GetCommandMetadata` starts
+  a pipeline on the server, like `CreatePipeline`, but was sent as a WS-Man
+  Send to a command that did not exist: a real server answered with the
+  fault "The given key was not present in the dictionary", every time. It
+  now goes out as a WS-Man Command under its own id
+  (`PsrpTransport::execute_pipeline`). Nothing changes over SSH, where the
+  two calls are the same. A transport of your own that overrides
+  `send_pipeline_fragment` must override `execute_pipeline` too, as it
+  already had to for `CreatePipeline`: the request no longer goes through
+  the former.
+- **Host method ids follow MS-PSRP 2.2.3.17.** `HostMethodId` numbered the
+  writes 11 to 18 and the reads 51 to 56, which is no version of the
+  protocol: a real server's `Read-Host` (11) would have been taken for a
+  write and never answered, leaving the remote script waiting for ever, and
+  its `Write-Host` (16) for a progress record. (No real server makes a host
+  call yet, see #52, so only a server written against psrp-rs's own numbers
+  is affected.) `from_i64` / `to_i64` now use the
+  protocol's numbers (`ReadLine` 11, `ReadLineAsSecureString` 12,
+  `WriteLine1`-`3` 15-17, `WriteErrorLine` 18, `WriteDebugLine` 19,
+  `WriteProgress` 20, `WriteVerboseLine` 21, `WriteWarningLine` 22, `Prompt`
+  23, `PromptForCredential` 24, `PromptForChoice` 26), and `is_void` follows
+  the protocol's table for all 56 methods: one that returns nothing is never
+  answered (it used to get an error response when psrp-rs did not know it),
+  every other one always is. `Write1` (13) and `Write2` (14) reach
+  `PsHost::write`, and `PromptForCredential2` (25) reaches
+  `PsHost::get_credential`; they still decode to `HostMethodId::Other`, as
+  a variant of their own would break exhaustive matches. Code that compared
+  `to_i64()` with the old numbers must use the new ones.
+
+### Security
+
+Everything a pool reads is chosen by the remote host. These fixes close the
+ways a hostile or broken server could exhaust the client's memory or CPU,
+keep it busy for ever, or leave resources behind. Found by an audit of the
+crate; none was reachable without controlling the server (or the connection
+to it, where TLS is not used).
+
+- **`<TNRef>` copies were not counted.** A list of type names stored once
+  and named by many objects was copied into each of them with nothing
+  charged: 45 KiB of CLIXML decoded to two million strings (+107 MiB), 90 KiB
+  to eight million. The copies are now charged before they are made, to a
+  budget in proportion to the length of the document.
+- **What a document decodes to is bounded.** Decoding amplifies (a `<Nil/>`
+  is six bytes of XML and one `PsValue` in memory, about twenty times more),
+  and the copy of a `<Ref>` was made before it was charged. The decoder now
+  counts every value, property, type name and copy as it builds it, and
+  stops at `DEFAULT_MAX_DECODED_SIZE` (1 GiB) for one `parse_clixml`
+  document, or at `ReceiveLimits::max_pipeline_size` for a pipeline. A
+  message the client reads for itself (a pipeline or pool state, a host
+  call, a session key) is bounded by the same figure, on its own.
+- **A message and a pipeline are bounded.** The reassembler buffered a
+  message until its last fragment, however long (one fragment may announce
+  4 GiB), and a pipeline held whatever the command returned: both grew until
+  the process ran out of memory, which is an abort, not an error. They now
+  end with `PsrpError::Fragment` or `PsrpError::Clixml` at the
+  `ReceiveLimits`. A fragment that announces more than the limit leaves is
+  refused on its header, and skipped as it arrives instead of buffered.
+- **Reassembly is linear.** `Reassembler::feed` shifted its buffer once per
+  fragment, so a chunk of 37 000 empty fragments took nine times longer than
+  the same fragments fed one by one. It also kept the id of every message it
+  ever completed.
+- **A pipeline over WinRM starts from a clean reassembler.** Each one is
+  read from a WS-Man command of its own, but the pool fed them all to one
+  reassembler: a message cut short when a pipeline was abandoned stayed in
+  it for the life of the pool and counted against the message limit, and
+  what was left to skip of a fragment refused for its size would have been
+  taken out of the next pipeline's stream. The pool now forgets what it
+  holds half received when a transport that says so
+  (`pipeline_has_its_own_stream`) starts a pipeline.
+- **Repeated XML attributes are not checked one against all.** quick-xml
+  checks each attribute name of a tag against the earlier ones, and a
+  repeated name costs a scan of all of them: 20 000 names followed by
+  20 000 copies of the last took seconds, 20 MB of them hours, inside one
+  call that nothing can interrupt. The decoder reads the first attribute of
+  the name it wants, as before, without the check.
+- **The ids that `<Ref>`s point to are counted.** They were collected as
+  text before anything was charged, from a document that may be nothing but
+  `<Ref>`s: several times the size of the message, outside every limit.
+  They are kept as hashes now, and charged like the copies they stand for,
+  as are the ids those copies are kept under.
+- **The server cannot make the client generate RSA keys without end.** Each
+  `PublicKeyRequest` that found no exchange in flight generated a 2048-bit
+  key pair, on the thread that drives the other tasks. A pool now refuses
+  after 8 exchanges it started on its own account, and generates the pair on
+  Tokio's blocking pool.
+- **Empty Receives answered at once are paced.** `WinrmPsrpTransport` sent
+  the next Receive immediately, for ever, to a server that answered each one
+  with nothing. The third quick empty poll in a row is now followed by
+  50 ms, doubling up to one second (the pace `winrm-rs` documents for
+  callers of `Shell::receive_next`).
+- **A failed open closes the shell.** When the handshake failed,
+  `RunspacePool::open_*` returned the error and dropped the only handle on
+  the shell, which stayed open on the server until its idle timeout and
+  counted against the user's shell quota.
+- **A command the client gives up on is stopped.** When a message did not
+  decode, or passed a limit, the read returned the error and the command
+  went on running on the server. The server is now asked to stop it first
+  (not after a transport error: the signal would go down the transport that
+  just failed). Best effort: the error of the read is returned whatever
+  becomes of the signal, at most half a second later over WinRM, where a
+  request that could not leave in that time is given up. Over WinRM a
+  command that was writing output stops once that output is taken: the
+  transport reads it, and drops it, for at most 5 s (closing the pool ends
+  the command either way).
+- **`get_command_metadata` reads its own pipeline only.** It took the
+  output and the terminal state of any pipeline, so a message with another
+  id, or a forged one, ended up in its result or ended it. It also follows
+  the `ReceiveLimits` now.
+- **Host answers waiting for a session key are bounded.** While the server
+  withheld the key, each host call answered with a `SecureString` parked one
+  more secret, without limit, and sending them took a time quadratic in
+  their number. Past 64 waiting answers a call gets an error response.
+- **Secrets a `PsHost` returns are wiped.** The plaintext of
+  `read_line_as_secure_string` and `get_credential` stayed in memory after
+  it was encrypted, in the answer parked for a session key, in a copy made
+  to encrypt an object, and in the buffers of `encrypt_secure_string` /
+  `decrypt_secure_string`; the unwrapped session key stayed on the stack.
+  All are now zeroed once used, and `Debug` no longer prints a
+  `SecureString`.
+
 ## [4.0.0] — 2026-11-01
 
 `winrm-rs` 2.0.1 or later is now required. The `AuthMethod`,
@@ -839,3 +1091,12 @@ as well as everything below.
 
 - Fragment layer, message header, basic CLIXML primitives, runspace
   pool, pipeline builder, transport trait, live Vagrant integration.
+
+[Unreleased]: https://github.com/muchiny/psrp-rs/compare/v4.0.0...HEAD
+[4.0.0]: https://github.com/muchiny/psrp-rs/compare/v3.1.0...v4.0.0
+[3.1.0]: https://github.com/muchiny/psrp-rs/compare/v3.0.0...v3.1.0
+[3.0.0]: https://github.com/muchiny/psrp-rs/compare/v2.0.2...v3.0.0
+[2.0.2]: https://github.com/muchiny/psrp-rs/compare/v2.0.1...v2.0.2
+[2.0.1]: https://github.com/muchiny/psrp-rs/compare/v2.0.0...v2.0.1
+[2.0.0]: https://github.com/muchiny/psrp-rs/compare/v1.0.0...v2.0.0
+[1.0.0]: https://github.com/muchiny/psrp-rs/releases/tag/v1.0.0

@@ -121,9 +121,7 @@ pub enum HostKeyPolicy {
 
 impl Default for HostKeyPolicy {
     fn default() -> Self {
-        let mut path = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_default();
+        let mut path = std::env::var_os("HOME").map_or_default(PathBuf::from);
         path.push(".ssh/known_hosts");
         Self::KnownHosts(path)
     }

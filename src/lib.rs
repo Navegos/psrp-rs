@@ -8,8 +8,9 @@
 //! - typed PowerShell objects on the `Output` stream;
 //! - isolated `Error`, `Warning`, `Verbose`, `Debug`, `Information` and
 //!   `Progress` streams;
-//! - a persistent [`RunspacePool`] that keeps a `powershell.exe` process
-//!   alive across many pipelines;
+//! - a persistent [`RunspacePool`] that keeps the remote PowerShell host
+//!   process alive across many pipelines (`wsmprovhost.exe` over WinRM,
+//!   `pwsh` over SSH);
 //! - a builder-style [`Pipeline`] API.
 //!
 //! [MS-PSRP]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-psrp/
@@ -52,12 +53,21 @@
 //!
 //! # Scope
 //!
-//! P0 covers: fragment/CLIXML primitives, opening a pool, running a script,
-//! collecting every standard stream. P1 extends to per-stream processing
-//! via the [`Pipeline`] builder (already available here) and a blocking
-//! wrapper in the [`blocking`] module. P2 items — `<Ref>`-based CLIXML
-//! round-tripping, pipeline input streaming, reconnect/disconnect — are
-//! still on the roadmap.
+//! Covered: the fragment and CLIXML codecs, opening a pool, running scripts
+//! or [`Pipeline`]s with every standard stream collected, pipeline input
+//! streaming ([`Pipeline::with_input`], [`PipelineHandle::write_input`]),
+//! cancellation, disconnect and reconnect over WinRM
+//! ([`RunspacePool::disconnect`], [`DisconnectedPool::reconnect`]), the
+//! session-key exchange for `SecureString`, and a synchronous wrapper in the
+//! [`blocking`] module. An SSH transport sits behind the `ssh` feature.
+//!
+//! Not there yet:
+//!
+//! - host calls against a real server: a [`PsHost`] is accepted, but the
+//!   pool still declares a null host, so PowerShell never calls it;
+//! - `<Ref>`-preserving CLIXML: the decoder resolves a `<Ref>` to a copy and
+//!   the encoder writes every object in full, so shared identity does not
+//!   survive a round trip.
 
 #![forbid(unsafe_code)]
 #![warn(missing_debug_implementations)]
@@ -113,19 +123,20 @@ pub use records::{
     ProgressRecord, TraceRecord, WarningRecord,
 };
 pub use runspace::{
-    DisconnectedPool, PROTOCOL_VERSION, RunspacePool, RunspacePoolState, RunspacePoolStateMachine,
+    DisconnectedPool, PROTOCOL_VERSION, ReceiveLimits, RunspacePool, RunspacePoolState,
+    RunspacePoolStateMachine,
 };
 pub use shared::SharedRunspacePool;
 pub use transport::{PsrpTransport, WinrmPsrpTransport};
 
 // Re-export the `winrm-rs` types commonly needed by callers so they
 // don't have to depend on `winrm-rs` directly: the client, its
-// configuration and credentials, and what the common 2.x settings need
+// configuration and credentials, and what the common settings need
 // (the builder for proxies and trusted certificates, `EncryptionMode` for
 // Basic over HTTP, `SecretString` for `WinrmConfig::proxy`). The rarer ones
 // (`TlsProvider`, `ProxySessionAuth`, the builder's typestate markers) stay
-// in `winrm-rs`. They are the `winrm-rs` 2.x types; a caller that also
-// imports `winrm_rs` itself must depend on `winrm-rs = "2"`, or it gets a
+// in `winrm-rs`. They are the `winrm-rs` 3.x types; a caller that also
+// imports `winrm_rs` itself must depend on `winrm-rs = "3"`, or it gets a
 // second, distinct set of types.
 pub use winrm_rs::{
     AuthMethod, EncryptionMode, SecretString, WinrmClient, WinrmClientBuilder, WinrmConfig,

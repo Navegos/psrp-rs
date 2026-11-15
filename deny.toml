@@ -2,9 +2,10 @@
 #
 #   cargo deny check
 #
-# Three things are enforced: no unpatched security advisories, no
-# licence that would make the crate undistributable, and no accidental
-# git/alternative-registry dependency.
+# Four things are enforced: no unpatched security advisories (and no
+# yanked crate), no licence that would make the crate undistributable, no
+# duplicate version or wildcard requirement in the tree beyond the `skip`
+# list, and no accidental git/alternative-registry dependency.
 
 [graph]
 all-features = true
@@ -16,17 +17,23 @@ ignore = [
   #
   # MS-PSRP 2.2.2.4 requires RSAES-PKCS1-v1_5 to unwrap the AES session
   # key used for `SecureString` transport, so the dependency is not
-  # optional. There is **no fixed release**: the advisory applies to
-  # every `rsa` 0.9.x and to the 0.10 release candidates alike, so
-  # upgrading changes nothing.
+  # optional. `rsa` 0.10.0 is the fixed release (the advisory lists
+  # `>= 0.10.0`), but this tree cannot reach it yet: `russh` 0.65.1, the
+  # latest, requires `rsa = "=0.10.0-rc.18"`, which the advisory still
+  # covers, and Cargo keeps a single 0.10.x, so `rsa = "0.10"` here fails
+  # to resolve under the `ssh` feature. Nor can one requirement serve
+  # both: 0.10.0 puts `Pkcs1v15Encrypt` behind a `pkcs1v15` feature that
+  # the release candidate does not have. russh's main branch already asks
+  # for `rsa = "0.10"` (seen 2026-11-14): once that is released, move
+  # `rsa` to 0.10 (and `rand` with it), then drop this entry.
   #
   # Exposure here is narrow: the crate only ever *decrypts* a session
   # key that the server encrypted with our own freshly generated,
   # single-use 2048-bit key pair. Recovering it would need a large
   # number of adaptive timing measurements against one short-lived key,
   # after which the attacker would learn a session key they already
-  # produced. Revisit as soon as `rsa` ships a constant-time release.
-  { id = "RUSTSEC-2023-0071", reason = "no fixed rsa release exists; required by MS-PSRP session-key exchange and, via russh/ssh-key, by RSA host/user keys ; revue avant 2027-01-19" },
+  # produced.
+  { id = "RUSTSEC-2023-0071", reason = "fixed in rsa 0.10.0, out of reach while russh 0.65.1 pins rsa =0.10.0-rc.18; required by MS-PSRP session-key exchange and, via russh/ssh-key, by RSA host/user keys ; revue avant 2027-01-19" },
 ]
 
 [licenses]

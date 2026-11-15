@@ -4,10 +4,12 @@
 use std::sync::Arc;
 
 use uuid::Uuid;
+use zeroize::Zeroize;
 
-use crate::clixml::{PsObject, PsValue, parse_clixml, to_clixml};
+use crate::clixml::decode::{DEFAULT_MAX_DECODED_SIZE, DecodeBudget, parse_clixml_transient};
+use crate::clixml::{PsObject, PsValue, to_clixml};
 use crate::error::{PsrpError, Result};
-use crate::fragment::{Reassembler, encode_message};
+use crate::fragment::{DEFAULT_MAX_MESSAGE_SIZE, Reassembler, encode_message};
 use crate::host::{HostMethodId, NoInteractionHost, PsHost, dispatch_host_call};
 use crate::message::{Destination, MessageType, PsrpMessage};
 use crate::transport::PsrpTransport;
@@ -25,6 +27,96 @@ fn take_object_id(counter: &mut u64) -> Result<u64> {
         .ok_or_else(|| PsrpError::protocol("fragment object id space exhausted"))?;
     Ok(id)
 }
+
+/// How much a pool accepts from the remote host before it gives up.
+///
+/// Everything a pool reads is chosen by the server: without a bound, one
+/// message that never ends, or a command whose output never stops, is
+/// buffered until the process runs out of memory, which is an abort, not an
+/// error the caller can handle. Passing a limit ends the read with
+/// [`PsrpError::Fragment`] (a message too large) or [`PsrpError::Clixml`]
+/// (too much decoded), and the pipeline that was running is stopped.
+///
+/// The defaults are generous on purpose (a pipeline may hold a gigabyte of
+/// values); lower them to what the caller expects to read, with
+/// [`RunspacePool::set_receive_limits`]:
+///
+/// ```
+/// use psrp_rs::ReceiveLimits;
+///
+/// let limits = ReceiveLimits::default()
+///     .with_max_message_size(16 << 20)
+///     .with_max_pipeline_size(256 << 20);
+/// assert_eq!(limits.max_message_size(), 16 << 20);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReceiveLimits {
+    max_message_size: usize,
+    max_pipeline_size: usize,
+}
+
+impl Default for ReceiveLimits {
+    fn default() -> Self {
+        Self {
+            max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+            max_pipeline_size: DEFAULT_MAX_DECODED_SIZE,
+        }
+    }
+}
+
+impl ReceiveLimits {
+    /// Largest PSRP message accepted, in bytes on the wire, and the most
+    /// that is buffered for the messages still incomplete. Default:
+    /// [`DEFAULT_MAX_MESSAGE_SIZE`]
+    /// (200 MiB).
+    #[must_use]
+    pub fn max_message_size(&self) -> usize {
+        self.max_message_size
+    }
+
+    /// Most memory the values one pipeline returns may take, all streams
+    /// together, in bytes as the decoder estimates them (see
+    /// [`parse_clixml`](crate::clixml::parse_clixml)): a value takes more room
+    /// decoded than on the wire.
+    /// A message the client reads for itself (a pipeline or pool state, a
+    /// host call, a session key) is bounded by the same figure, on its own.
+    /// Default:
+    /// [`DEFAULT_MAX_DECODED_SIZE`]
+    /// (1 GiB).
+    #[must_use]
+    pub fn max_pipeline_size(&self) -> usize {
+        self.max_pipeline_size
+    }
+
+    /// Set [`max_message_size`](Self::max_message_size).
+    #[must_use]
+    pub fn with_max_message_size(mut self, bytes: usize) -> Self {
+        self.max_message_size = bytes;
+        self
+    }
+
+    /// Set [`max_pipeline_size`](Self::max_pipeline_size).
+    #[must_use]
+    pub fn with_max_pipeline_size(mut self, bytes: usize) -> Self {
+        self.max_pipeline_size = bytes;
+        self
+    }
+}
+
+/// How many session-key exchanges a pool starts on its own account (for a
+/// host answer holding a `SecureString`, or at the server's
+/// `PublicKeyRequest`) before it refuses.
+///
+/// Each one generates an RSA-2048 key pair, a few hundred milliseconds of
+/// CPU, and the server decides how many: it completes an exchange and asks
+/// for the next. A real server asks once, and once more after it lost the key
+/// across a reconnect.
+const MAX_POOL_KEY_EXCHANGES: u32 = 8;
+
+/// Host answers that may wait for a session key at once. Each one holds a
+/// secret the host gave, for as long as the server withholds the key; a
+/// server asking for more gets an error for the ones over this.
+const MAX_DEFERRED_HOST_RESPONSES: usize = 64;
 
 /// A runspace pool.
 ///
@@ -48,15 +140,30 @@ pub struct RunspacePool<T: PsrpTransport> {
     /// Messages decoded from a single recv_chunk that contained multiple
     /// PSRP messages. Drained before the next transport read.
     pending_messages: Vec<PsrpMessage>,
+    limits: ReceiveLimits,
+    /// Exchanges started by the pool itself, see [`MAX_POOL_KEY_EXCHANGES`].
+    pool_key_exchanges: u32,
+    /// The last call made on the transport failed, see
+    /// [`Self::transport_failing`].
+    transport_failing: bool,
 }
 
 /// A host-call answer waiting for the session key.
+///
+/// `value` holds the plaintext of a `SecureString` as the host returned it:
+/// it is wiped when the answer is dropped, sent or not.
 struct DeferredHostResponse {
     response_type: MessageType,
     pid: Uuid,
     ci: i64,
     mi: i64,
     value: PsValue,
+}
+
+impl Drop for DeferredHostResponse {
+    fn drop(&mut self) {
+        wipe_secure_strings(&mut self.value);
+    }
 }
 
 impl<T: PsrpTransport> RunspacePool<T> {
@@ -106,12 +213,35 @@ impl<T: PsrpTransport> RunspacePool<T> {
             pending_client_key: None,
             deferred_host_responses: Vec::new(),
             pending_messages: Vec::new(),
+            limits: ReceiveLimits::default(),
+            pool_key_exchanges: 0,
+            transport_failing: false,
         };
 
         let actions = pool.machine.open();
-        pool.execute(actions).await?;
-        pool.drain_until_opened().await?;
-        Ok(pool)
+        pool.finish_open(actions).await
+    }
+
+    /// Send the opening `actions` and read until the pool is `Opened`.
+    ///
+    /// When that fails the caller gets an error and no pool, so nobody could
+    /// close the shell any more: it stayed open on the server until its idle
+    /// timeout, and a server that refuses the handshake every time (or a
+    /// caller that retries) filled the user's shell quota. It is closed here
+    /// instead, before the error is returned.
+    async fn finish_open(mut self, actions: Vec<Action>) -> Result<Self> {
+        let opened = match self.execute(actions).await {
+            Ok(()) => self.drain_until_opened().await,
+            Err(e) => Err(e),
+        };
+        if let Err(e) = opened {
+            self.closed = true;
+            if let Err(close_err) = self.transport.close_shell().await {
+                tracing::debug!("shell close after failed open: {close_err}");
+            }
+            return Err(e);
+        }
+        Ok(self)
     }
 
     /// Build the raw PSRP opening fragments (SessionCapability +
@@ -183,7 +313,7 @@ impl<T: PsrpTransport> RunspacePool<T> {
         let mut machine = RunspacePoolStateMachine::new(rpid, min_runspaces, max_runspaces)?;
         // Manually advance past BeforeOpen → NegotiationSent.
         let _ = machine.open(); // produces actions we won't send (already sent)
-        let mut pool = Self {
+        let pool = Self {
             transport,
             reassembler: Reassembler::new(),
             machine,
@@ -194,9 +324,11 @@ impl<T: PsrpTransport> RunspacePool<T> {
             pending_client_key: None,
             deferred_host_responses: Vec::new(),
             pending_messages: Vec::new(),
+            limits: ReceiveLimits::default(),
+            pool_key_exchanges: 0,
+            transport_failing: false,
         };
-        pool.drain_until_opened().await?;
-        Ok(pool)
+        pool.finish_open(Vec::new()).await
     }
 
     /// Current state.
@@ -223,6 +355,28 @@ impl<T: PsrpTransport> RunspacePool<T> {
         self.machine.rpid()
     }
 
+    /// The bounds on what this pool accepts from the server.
+    #[must_use]
+    pub fn receive_limits(&self) -> ReceiveLimits {
+        self.limits
+    }
+
+    /// Change the bounds on what this pool accepts from the server. They
+    /// apply from the next fragment read and the next pipeline started; a
+    /// pool is opened with [`ReceiveLimits::default`].
+    pub fn set_receive_limits(&mut self, limits: ReceiveLimits) {
+        self.limits = limits;
+        self.reassembler
+            .set_max_message_size(limits.max_message_size());
+    }
+
+    /// The budget of a message the pool reads for itself (a pool state, a
+    /// host call, a session key). Each is decoded and dropped, so each gets
+    /// a whole one: `max_pipeline_size`, like a pipeline.
+    fn control_budget(&self) -> DecodeBudget {
+        DecodeBudget::new(self.limits.max_pipeline_size())
+    }
+
     /// Return `Err(BadState)` unless `self.state() == expected`.
     pub fn ensure_state(&self, expected: RunspacePoolState) -> Result<()> {
         if self.machine.state() != expected {
@@ -237,8 +391,8 @@ impl<T: PsrpTransport> RunspacePool<T> {
     /// Disconnect the pool, leaving the server-side shell alive so it
     /// can be reconnected later via [`DisconnectedPool::reconnect`].
     ///
-    /// Sends `CloseRunspacePool` is **not** called — the runspace stays
-    /// alive on the server. To tear it down for good, call [`RunspacePool::close`]
+    /// `CloseRunspacePool` is **not** sent — the runspace stays alive on
+    /// the server. To tear it down for good, call [`RunspacePool::close`]
     /// instead.
     pub async fn disconnect(mut self) -> Result<DisconnectedPool> {
         if self.closed {
@@ -273,6 +427,7 @@ impl<T: PsrpTransport> RunspacePool<T> {
             max_runspaces: self.machine.max_runspaces(),
             host: self.host.clone(),
             session_key: self.session_key.clone(),
+            limits: self.limits,
         })
     }
 
@@ -383,7 +538,7 @@ impl<T: PsrpTransport> RunspacePool<T> {
         // An exchange the pool already started (a host call that needs the
         // key, or the server's `PublicKeyRequest`) is awaited, not repeated.
         if self.pending_client_key.is_none() {
-            let client_key = crate::crypto::ClientSessionKey::generate()?;
+            let client_key = generate_client_key().await?;
             self.start_exchange(client_key).await?;
         }
         self.await_session_key().await
@@ -427,11 +582,21 @@ impl<T: PsrpTransport> RunspacePool<T> {
     /// a server that sends `PublicKeyRequest` has no key for this client
     /// (it may have lost it across a reconnect), and the new key then
     /// replaces the old.
+    ///
+    /// The server decides how often this runs, so it is refused after
+    /// [`MAX_POOL_KEY_EXCHANGES`], before a key pair is generated.
     async fn start_exchange_unless_pending(&mut self) -> Result<()> {
         if self.pending_client_key.is_some() {
             return Ok(());
         }
-        let client_key = crate::crypto::ClientSessionKey::generate()?;
+        if self.pool_key_exchanges >= MAX_POOL_KEY_EXCHANGES {
+            return Err(PsrpError::protocol(format!(
+                "the server made the pool start {MAX_POOL_KEY_EXCHANGES} session-key exchanges \
+                 already: refusing another one"
+            )));
+        }
+        self.pool_key_exchanges = self.pool_key_exchanges.saturating_add(1);
+        let client_key = generate_client_key().await?;
         self.start_exchange(client_key).await
     }
 
@@ -450,7 +615,8 @@ impl<T: PsrpTransport> RunspacePool<T> {
         while self.session_key.is_none() {
             let msg = self.next_message().await?;
             if msg.message_type != MessageType::EncryptedSessionKey {
-                self.machine.on_message(&msg)?;
+                let budget = self.control_budget();
+                self.machine.on_message_within(&msg, &budget)?;
             }
         }
         Ok(())
@@ -468,7 +634,11 @@ impl<T: PsrpTransport> RunspacePool<T> {
             tracing::debug!("EncryptedSessionKey without a pending exchange: ignored");
             return Ok(());
         };
-        if let Err(e) = self.take_session_key(msg, &client_key) {
+        let taken = self.take_session_key(msg, &client_key);
+        // The private key has done its work: it is wiped now, not after the
+        // sends below.
+        drop(client_key);
+        if let Err(e) = taken {
             self.fail_deferred_host_responses(&e).await;
             return Err(e);
         }
@@ -480,7 +650,7 @@ impl<T: PsrpTransport> RunspacePool<T> {
         msg: &PsrpMessage,
         client_key: &crate::crypto::ClientSessionKey,
     ) -> Result<()> {
-        let parsed = parse_clixml(&msg.data)?;
+        let parsed = parse_clixml_transient(&msg.data, &self.control_budget())?;
         let encoded = parsed
             .into_iter()
             .find_map(|v| match v {
@@ -498,8 +668,10 @@ impl<T: PsrpTransport> RunspacePool<T> {
         // MS-PSRP 2.2.2.4 — the property is base64, not hex.
         let bytes = crate::clixml::encode::base64_decode(&encoded)
             .ok_or_else(|| PsrpError::protocol("EncryptedSessionKey: invalid base64"))?;
-        let raw = client_key.decrypt_session_key(&bytes)?;
+        let mut raw = client_key.decrypt_session_key(&bytes)?;
         self.session_key = Some(crate::crypto::SessionKey::from_bytes(raw));
+        // `[u8; 32]` is `Copy`: `from_bytes` took a copy, this one is ours.
+        raw.zeroize();
         Ok(())
     }
 
@@ -558,7 +730,21 @@ impl<T: PsrpTransport> RunspacePool<T> {
         let encoded = msg.encode();
         let oid = take_object_id(&mut self.next_object_id)?;
         let frag_bytes = encode_message(oid, &encoded);
-        self.transport.send_fragment(&frag_bytes).await
+        let sent = self.transport.send_fragment(&frag_bytes).await;
+        self.observe(sent)
+    }
+
+    /// Record how a call on the transport went.
+    fn observe<R>(&mut self, outcome: Result<R>) -> Result<R> {
+        self.transport_failing = outcome.is_err();
+        outcome
+    }
+
+    /// Whether the last send or receive on the transport failed: the error a
+    /// reader has just been given is then the transport's, not one the pool
+    /// raised on what it read (a malformed message, a limit passed).
+    pub(crate) fn transport_failing(&self) -> bool {
+        self.transport_failing
     }
 
     pub(crate) async fn next_message(&mut self) -> Result<PsrpMessage> {
@@ -589,7 +775,8 @@ impl<T: PsrpTransport> RunspacePool<T> {
                 }
             }
 
-            let chunk = self.transport.recv_chunk().await?;
+            let received = self.transport.recv_chunk().await;
+            let chunk = self.observe(received)?;
             if chunk.is_empty() {
                 if self.reassembler.is_idle() && self.pending_messages.is_empty() {
                     return Ok(PsrpMessage {
@@ -618,14 +805,13 @@ impl<T: PsrpTransport> RunspacePool<T> {
     async fn handle_host_call(&mut self, msg: &PsrpMessage) -> Result<()> {
         // PSRP host call body: an Obj with MS containing ci (call id, I64),
         // mi (method id, I32/I64 depending on server), mp (method params list).
-        let parsed = parse_clixml(&msg.data)?;
+        let parsed = parse_clixml_transient(&msg.data, &self.control_budget())?;
         let root = parsed
             .into_iter()
             .next()
             .ok_or_else(|| PsrpError::protocol("host call: empty body"))?;
-        let obj = match &root {
-            PsValue::Object(o) => o,
-            _ => return Err(PsrpError::protocol("host call: body is not an object")),
+        let PsValue::Object(mut obj) = root else {
+            return Err(PsrpError::protocol("host call: body is not an object"));
         };
         let ci = obj
             .get("ci")
@@ -643,10 +829,12 @@ impl<T: PsrpTransport> RunspacePool<T> {
             .and_then(|v| v.as_i64().or_else(|| v.as_i32().map(i64::from)))
             .ok_or_else(|| PsrpError::protocol("host call: missing mi"))?;
         let mi = HostMethodId::from_i64(mi_raw);
-        let mp: Vec<PsValue> = match obj.get("mp") {
-            Some(PsValue::List(items)) => items.clone(),
-            Some(PsValue::Object(inner)) => match inner.get("_value") {
-                Some(PsValue::List(items)) => items.clone(),
+        // Taken out of the message, not copied: the arguments are as large
+        // as the server likes, within the limit they were decoded under.
+        let mp: Vec<PsValue> = match obj.properties.swap_remove("mp") {
+            Some(PsValue::List(items)) => items,
+            Some(PsValue::Object(mut inner)) => match inner.properties.swap_remove("_value") {
+                Some(PsValue::List(items)) => items,
                 _ => Vec::new(),
             },
             _ => Vec::new(),
@@ -683,16 +871,38 @@ impl<T: PsrpTransport> RunspacePool<T> {
         let mut value = response_value;
         if contains_secure_string(&value) {
             match self.session_key.clone() {
-                Some(key) => value = encrypt_secure_strings(&value, &key),
+                Some(key) => {
+                    let encrypted = encrypt_secure_strings(&value, &key);
+                    // The plaintext the host returned is not needed any more.
+                    wipe_secure_strings(&mut value);
+                    value = encrypted;
+                }
                 None => {
-                    self.ensure_key_exchange_started().await?;
-                    self.deferred_host_responses.push(DeferredHostResponse {
+                    if self.deferred_host_responses.len() >= MAX_DEFERRED_HOST_RESPONSES {
+                        // The server keeps asking and gives no key: this
+                        // answer is refused, not parked with the others.
+                        wipe_secure_strings(&mut value);
+                        let body = build_host_response_error_body(
+                            ci,
+                            mi_raw,
+                            "too many answers are waiting for the session key",
+                        );
+                        return self
+                            .send_pipeline_message(response_type, msg.pid, body)
+                            .await;
+                    }
+                    // Parked before the exchange is started: if that fails,
+                    // or this call is dropped while it waits, the answer is
+                    // dropped with it and `Drop` wipes its plaintext.
+                    let waiting = DeferredHostResponse {
                         response_type,
                         pid: msg.pid,
                         ci,
                         mi: mi_raw,
                         value,
-                    });
+                    };
+                    self.ensure_key_exchange_started().await?;
+                    self.deferred_host_responses.push(waiting);
                     return Ok(());
                 }
             }
@@ -708,6 +918,12 @@ impl<T: PsrpTransport> RunspacePool<T> {
 
     pub(crate) async fn signal_transport_stop(&mut self) -> Result<()> {
         self.transport.signal_stop().await
+    }
+
+    /// The reader of the pipeline gives up before its end (see
+    /// [`PsrpTransport::abandon_pipeline`]).
+    pub(crate) async fn abandon_transport_pipeline(&mut self) {
+        self.transport.abandon_pipeline().await;
     }
 
     pub(crate) async fn send_pipeline_message(
@@ -727,15 +943,33 @@ impl<T: PsrpTransport> RunspacePool<T> {
         let oid = self.allocate_object_id()?;
         let frag_bytes = encode_message(oid, &encoded);
 
-        // For CreatePipeline: the first fragment must go via Execute
-        // (Command) with the PID as CommandId, not via Send.
-        if mt == MessageType::CreatePipeline {
-            self.transport.execute_pipeline(&frag_bytes, pid).await
+        // A message that starts a pipeline on the server (`CreatePipeline`,
+        // and `GetCommandMetadata`, which is one too) must go via Execute
+        // (Command) with the PID as CommandId, not via Send: over WinRM a
+        // Send needs a command that exists, and the plugin answers one for
+        // an unknown id with a fault ("The given key was not present in the
+        // dictionary", which is what `get_command_metadata` got).
+        let starts_pipeline = matches!(
+            mt,
+            MessageType::CreatePipeline | MessageType::GetCommandMetadata
+        );
+        let sent = if starts_pipeline {
+            let started = self.transport.execute_pipeline(&frag_bytes, pid).await;
+            // Over WinRM this pipeline is read from a stream of its own.
+            // What the reassembler still holds comes from the stream before
+            // (a message cut short when its pipeline was abandoned, the rest
+            // of a fragment refused for its size): none of it continues
+            // here, and kept, it would swallow or corrupt what follows.
+            if started.is_ok() && self.transport.pipeline_has_its_own_stream() {
+                self.reassembler.clear();
+            }
+            started
         } else {
             self.transport
                 .send_pipeline_fragment(&frag_bytes, pid)
                 .await
-        }
+        };
+        self.observe(sent)
     }
 
     // --- private ---
@@ -755,7 +989,8 @@ impl<T: PsrpTransport> RunspacePool<T> {
     async fn drain_until_opened(&mut self) -> Result<()> {
         loop {
             let msg = self.next_message().await?;
-            self.machine.on_message(&msg)?;
+            let budget = self.control_budget();
+            self.machine.on_message_within(&msg, &budget)?;
             if self.machine.is_opened() {
                 return Ok(());
             }
@@ -776,6 +1011,7 @@ pub struct DisconnectedPool {
     max_runspaces: i32,
     host: Arc<dyn PsHost>,
     session_key: Option<crate::crypto::SessionKey>,
+    limits: ReceiveLimits,
 }
 
 impl std::fmt::Debug for DisconnectedPool {
@@ -831,7 +1067,7 @@ impl DisconnectedPool {
         debug_assert!(actions.is_empty() && machine.is_opened());
         let pool = RunspacePool {
             transport,
-            reassembler: Reassembler::new(),
+            reassembler: Reassembler::with_max_message_size(self.limits.max_message_size()),
             machine,
             next_object_id: 1,
             closed: false,
@@ -840,6 +1076,9 @@ impl DisconnectedPool {
             pending_client_key: None,
             deferred_host_responses: Vec::new(),
             pending_messages: Vec::new(),
+            limits: self.limits,
+            pool_key_exchanges: 0,
+            transport_failing: false,
         };
         Ok(pool)
     }
@@ -883,13 +1122,52 @@ fn encrypt_secure_strings(value: &PsValue, key: &crate::crypto::SessionKey) -> P
                 .collect(),
         ),
         PsValue::Object(obj) => {
-            let mut out = obj.clone();
-            for v in out.properties.values_mut() {
-                *v = encrypt_secure_strings(v, key);
+            // Built property by property: cloning the object first would
+            // copy the plaintexts, and drop the copies unwiped.
+            let mut out = PsObject::new();
+            out.type_names.clone_from(&obj.type_names);
+            out.to_string.clone_from(&obj.to_string);
+            for (name, v) in &obj.properties {
+                out.properties
+                    .insert(name.clone(), encrypt_secure_strings(v, key));
             }
             PsValue::Object(out)
         }
         other => other.clone(),
+    }
+}
+
+/// Overwrite every `SecureString` held in `value` with zeroes (the string is
+/// left empty). For the plaintexts a [`PsHost`] returns, once they have been
+/// encrypted or given up.
+fn wipe_secure_strings(value: &mut PsValue) {
+    match value {
+        PsValue::SecureString(secret) => secret.zeroize(),
+        PsValue::List(items) => items.iter_mut().for_each(wipe_secure_strings),
+        PsValue::Dict(entries) => {
+            for (k, v) in entries {
+                wipe_secure_strings(k);
+                wipe_secure_strings(v);
+            }
+        }
+        PsValue::Object(obj) => obj.properties.values_mut().for_each(wipe_secure_strings),
+        _ => {}
+    }
+}
+
+/// Generate the RSA key pair of a session-key exchange.
+///
+/// A 2048-bit key takes a few hundred milliseconds of CPU, so it runs on
+/// Tokio's blocking pool, not on the thread that drives the other tasks. A
+/// pool driven by another executor has no such pool: the key is then
+/// generated in place, as it always was.
+async fn generate_client_key() -> Result<crate::crypto::ClientSessionKey> {
+    match tokio::runtime::Handle::try_current() {
+        Ok(runtime) => runtime
+            .spawn_blocking(crate::crypto::ClientSessionKey::generate)
+            .await
+            .map_err(|e| PsrpError::protocol(format!("RSA key generation did not finish: {e}")))?,
+        Err(_) => crate::crypto::ClientSessionKey::generate(),
     }
 }
 
@@ -939,6 +1217,7 @@ impl<T: PsrpTransport> Drop for RunspacePool<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clixml::parse_clixml;
     use crate::clixml::{PsObject, to_clixml};
 
     #[test]
@@ -2125,15 +2404,494 @@ mod tests {
         assert_eq!(t.sent().len(), 4);
     }
 
+    /// `GetCommandMetadata` starts a pipeline on the server, like
+    /// `CreatePipeline`: it goes out through `execute_pipeline` under an id
+    /// of its own (a WS-Man Command over WinRM), not as a Send to a command
+    /// that does not exist. A real server answered that Send with a fault.
     #[tokio::test]
-    async fn command_metadata_is_routed_with_its_pid() {
+    async fn command_metadata_starts_a_pipeline_of_its_own() {
         let t = MockTransport::new();
         let mut pool = opened_pool_with_host(&t, Arc::new(NoInteractionHost)).await;
         // The empty inbox makes the wait for the reply fail, as expected.
         let _ = pool
             .get_command_metadata(&["Get-Date"], crate::metadata::CommandType::CMDLET)
             .await;
-        assert_eq!(t.pipeline_sends().len(), 1);
-        assert!(!t.pipeline_sends()[0].is_nil());
+        assert_eq!(t.pipeline_starts().len(), 1);
+        assert!(!t.pipeline_starts()[0].is_nil());
+        assert_eq!(t.pipeline_sends(), Vec::<Uuid>::new());
+    }
+
+    /// And on a transport where a pipeline has a stream of its own, what the
+    /// reassembler held is forgotten when the request starts, as for
+    /// `CreatePipeline`.
+    #[tokio::test]
+    async fn command_metadata_on_its_own_stream_starts_with_a_clean_reassembler() {
+        let t = MockTransport::new();
+        *t.own_stream_per_pipeline.lock().unwrap() = true;
+        let mut pool = opened_pool_with_host(&t, Arc::new(NoInteractionHost)).await;
+        // The first half of a fragment, left by the stream before.
+        let whole = wire(40, &state_message_bytes(RunspacePoolState::Opened));
+        pool.reassembler.feed(&whole[..10]).unwrap();
+        assert!(!pool.reassembler.is_idle());
+
+        let _ = pool
+            .get_command_metadata(&["Get-Date"], crate::metadata::CommandType::CMDLET)
+            .await;
+        assert!(pool.reassembler.is_idle(), "the old stream leaked in");
+    }
+
+    // ---------- receive limits, failed open, key-exchange cap, wiping ----------
+
+    /// Regression: when the handshake failed, `open` returned the error and
+    /// dropped the pool, the only handle on the shell, which then stayed
+    /// open on the server until its idle timeout.
+    #[tokio::test]
+    async fn a_failed_open_closes_the_shell() {
+        // The server breaks the pool during the handshake.
+        let t = MockTransport::new();
+        t.push_incoming(wire(1, &state_message_bytes(RunspacePoolState::Broken)));
+        let err = RunspacePool::open_with_transport(t.clone())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PsrpError::Protocol(_)), "{err:?}");
+        assert!(*t.closed.lock().unwrap(), "shell left open");
+
+        // The transport fails before the server says anything.
+        let t = MockTransport::new();
+        let err = RunspacePool::open_with_transport(t.clone())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("mock inbox empty"), "{err}");
+        assert!(*t.closed.lock().unwrap(), "shell left open");
+
+        // The opening messages cannot be sent.
+        let t = MockTransport::new();
+        *t.fail_send.lock().unwrap() = true;
+        let err = RunspacePool::open_with_transport(t.clone())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("mock send failure"), "{err}");
+        assert!(*t.closed.lock().unwrap(), "shell left open");
+
+        // Same on the path the WinRM transport takes.
+        let t = MockTransport::new();
+        t.push_incoming(wire(1, &state_message_bytes(RunspacePoolState::Broken)));
+        let err = RunspacePool::open_from_transport(t.clone(), Uuid::new_v4(), 1, 1)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PsrpError::Protocol(_)), "{err:?}");
+        assert!(*t.closed.lock().unwrap(), "shell left open");
+    }
+
+    /// A pool that opened is not closed by `open`.
+    #[tokio::test]
+    async fn a_successful_open_leaves_the_shell_open() {
+        let t = MockTransport::new();
+        t.push_incoming(wire(1, &state_message_bytes(RunspacePoolState::Opened)));
+        let pool = RunspacePool::open_from_transport(t.clone(), Uuid::new_v4(), 1, 1)
+            .await
+            .unwrap();
+        assert!(!*t.closed.lock().unwrap());
+        assert!(!pool.closed);
+        let _ = pool.close().await;
+    }
+
+    #[test]
+    fn receive_limits_default_and_setters() {
+        let limits = ReceiveLimits::default();
+        assert_eq!(limits.max_message_size(), 200 << 20);
+        assert_eq!(limits.max_pipeline_size(), 1 << 30);
+        let limits = limits.with_max_message_size(7).with_max_pipeline_size(9);
+        assert_eq!(
+            (limits.max_message_size(), limits.max_pipeline_size()),
+            (7, 9)
+        );
+    }
+
+    /// Regression: the messages the pool reads for itself (host calls, pool
+    /// states, session keys) were decoded against the default gibibyte,
+    /// whatever `max_pipeline_size` said.
+    #[tokio::test]
+    async fn control_messages_are_bounded_by_max_pipeline_size() {
+        let node = std::mem::size_of::<PsValue>();
+        let padding = || std::iter::repeat_n(PsValue::Null, 1000);
+
+        // A host call: `WriteLine2` with a thousand arguments nobody reads.
+        let t = MockTransport::new();
+        let host = crate::host::BufferedHost::new();
+        let mut pool = opened_pool_with_host(&t, Arc::new(host.clone())).await;
+        let args: Vec<_> = std::iter::once(PsValue::String("hello".into()))
+            .chain(padding())
+            .collect();
+        let call = host_call_bytes(1, 16, PsValue::List(args));
+        let other = state_message_bytes(RunspacePoolState::Opened);
+
+        pool.set_receive_limits(pool.receive_limits().with_max_pipeline_size(4000 * node));
+        t.push_incoming(wire(10, &call));
+        t.push_incoming(wire(11, &other));
+        pool.next_message().await.unwrap();
+        assert_eq!(host.lines(), ["hello"], "with room, the host is called");
+
+        pool.set_receive_limits(pool.receive_limits().with_max_pipeline_size(500 * node));
+        t.push_incoming(wire(12, &call));
+        let err = pool.next_message().await.unwrap_err();
+        assert!(matches!(err, PsrpError::Clixml(_)), "{err:?}");
+        assert_eq!(host.lines(), ["hello"], "the host was not called again");
+        let _ = pool.close().await;
+
+        // The pool state that ends the handshake.
+        let padded_state = PsrpMessage {
+            destination: Destination::Client,
+            message_type: MessageType::RunspacePoolState,
+            rpid: Uuid::nil(),
+            pid: Uuid::nil(),
+            data: to_clixml(&PsValue::Object(
+                PsObject::new()
+                    .with(
+                        "RunspaceState",
+                        PsValue::I32(RunspacePoolState::Opened as i32),
+                    )
+                    .with("Padding", PsValue::List(padding().collect())),
+            )),
+        }
+        .encode();
+        let machine = |limit: usize| {
+            let mut machine = RunspacePoolStateMachine::new(Uuid::nil(), 1, 1).unwrap();
+            let _ = machine.open();
+            let msg = PsrpMessage::decode(&padded_state).unwrap();
+            let outcome = machine.on_message_within(&msg, &DecodeBudget::new(limit));
+            (outcome, machine.state())
+        };
+        let (outcome, state) = machine(4000 * node);
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert_eq!(state, RunspacePoolState::Opened);
+        let (outcome, state) = machine(500 * node);
+        assert!(matches!(outcome, Err(PsrpError::Clixml(_))), "{outcome:?}");
+        assert_ne!(state, RunspacePoolState::Opened);
+    }
+
+    /// Regression: the reassembler outlived the stream it was fed from. Over
+    /// WinRM each pipeline is read from a command of its own, so what an
+    /// abandoned pipeline left behind (a message cut short, the rest of a
+    /// fragment refused for its size, here 5000 bytes still to skip) was
+    /// taken out of the next pipeline's stream, which then never completed.
+    #[tokio::test]
+    async fn a_pipeline_on_its_own_stream_starts_with_a_clean_reassembler() {
+        for own_stream in [true, false] {
+            let t = MockTransport::new();
+            *t.own_stream_per_pipeline.lock().unwrap() = own_stream;
+            t.push_incoming(wire(1, &state_message_bytes(RunspacePoolState::Opened)));
+            let mut pool = RunspacePool::open_with_transport(t.clone()).await.unwrap();
+            pool.set_receive_limits(ReceiveLimits::default().with_max_message_size(1024));
+
+            // The start of a message that never ends, then a header that
+            // announces more than the limit: start | end, 5000 bytes.
+            let cut_short = crate::fragment::Fragment {
+                object_id: 7,
+                fragment_id: 0,
+                start: true,
+                end: false,
+                blob: vec![0u8; 10],
+            };
+            let mut too_long = Vec::new();
+            too_long.extend_from_slice(&8u64.to_be_bytes());
+            too_long.extend_from_slice(&0u64.to_be_bytes());
+            too_long.push(0b11);
+            too_long.extend_from_slice(&5000u32.to_be_bytes());
+            t.push_incoming([cut_short.encode(), too_long].concat());
+            let err = pool.next_message().await.unwrap_err();
+            assert!(matches!(err, PsrpError::Fragment(_)), "{err:?}");
+            assert!(!pool.reassembler.is_idle());
+
+            pool.send_pipeline_message(
+                MessageType::CreatePipeline,
+                Uuid::new_v4(),
+                r#"<Obj RefId="0"><MS/></Obj>"#.into(),
+            )
+            .await
+            .unwrap();
+            // One stream for everything (the default): what is left of it is
+            // still to come, and is kept.
+            assert_eq!(pool.reassembler.is_idle(), own_stream);
+            if own_stream {
+                // The new stream is read from its first byte, and may reuse
+                // the object id the other one left open.
+                t.push_incoming(wire(7, &state_message_bytes(RunspacePoolState::Opened)));
+                let msg = pool.next_message().await.unwrap();
+                assert_eq!(msg.message_type, MessageType::RunspacePoolState);
+            }
+            let _ = pool.close().await;
+        }
+    }
+
+    /// A pipeline that could not be started leaves the reassembler alone.
+    #[tokio::test]
+    async fn a_pipeline_that_does_not_start_keeps_the_reassembler() {
+        let t = MockTransport::new();
+        *t.own_stream_per_pipeline.lock().unwrap() = true;
+        t.push_incoming(wire(1, &state_message_bytes(RunspacePoolState::Opened)));
+        let mut pool = RunspacePool::open_with_transport(t.clone()).await.unwrap();
+        t.push_incoming(vec![0u8; 5]);
+        t.push_incoming(wire(2, &state_message_bytes(RunspacePoolState::Opened)));
+        *t.fail_send.lock().unwrap() = true;
+        let sent = pool
+            .send_pipeline_message(MessageType::CreatePipeline, Uuid::new_v4(), String::new())
+            .await;
+        assert!(sent.is_err());
+        assert!(pool.transport_failing());
+        *t.fail_send.lock().unwrap() = false;
+        // Five bytes of a header were read before: still there.
+        let _ = pool.reassembler.feed(&[0u8; 5]);
+        assert!(!pool.reassembler.is_idle());
+        let _ = pool.close().await;
+    }
+
+    /// Regression: while the server withheld the session key, every host
+    /// call answered with a `SecureString` parked one more secret, without
+    /// limit (and sending them took a time quadratic in their number). Past
+    /// 64 the call is answered with an error.
+    #[tokio::test]
+    async fn parked_host_answers_are_bounded() {
+        let t = MockTransport::new();
+        let mut pool = opened_pool_with_host(&t, Arc::new(SecretHost)).await;
+        for _ in 0..MAX_DEFERRED_HOST_RESPONSES {
+            pool.handle_host_call(&secure_host_call()).await.unwrap();
+        }
+        assert_eq!(
+            pool.deferred_host_responses.len(),
+            MAX_DEFERRED_HOST_RESPONSES
+        );
+        let responses = |t: &MockTransport| {
+            sent_messages(t)
+                .into_iter()
+                .filter(|m| m.message_type == MessageType::RunspacePoolHostResponse)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(responses(&t).len(), 0, "all wait for the key");
+
+        pool.handle_host_call(&secure_host_call()).await.unwrap();
+        assert_eq!(
+            pool.deferred_host_responses.len(),
+            MAX_DEFERRED_HOST_RESPONSES
+        );
+        let refused = responses(&t);
+        assert_eq!(refused.len(), 1, "the 65th is answered at once");
+        assert!(
+            refused[0].data.contains("too many answers are waiting"),
+            "{}",
+            refused[0].data
+        );
+        assert!(!refused[0].data.contains("hunter2"));
+        let _ = pool.close().await;
+    }
+
+    /// The message limit is the reassembler's: a message over it ends the
+    /// read with a fragment error, and the limits survive a reconnect.
+    #[tokio::test]
+    async fn receive_limits_bound_a_message_and_survive_a_reconnect() {
+        let big = PsrpMessage {
+            destination: Destination::Client,
+            message_type: MessageType::ApplicationPrivateData,
+            rpid: Uuid::nil(),
+            pid: Uuid::nil(),
+            data: "x".repeat(4096),
+        }
+        .encode();
+
+        let t = MockTransport::new();
+        t.push_incoming(wire(1, &state_message_bytes(RunspacePoolState::Opened)));
+        let mut pool = RunspacePool::open_with_transport(t.clone()).await.unwrap();
+        assert_eq!(pool.receive_limits(), ReceiveLimits::default());
+
+        // Under the default limit the message is read.
+        t.push_incoming(wire(2, &big));
+        assert_eq!(
+            pool.next_message().await.unwrap().message_type,
+            MessageType::ApplicationPrivateData
+        );
+
+        let limits = ReceiveLimits::default()
+            .with_max_message_size(1024)
+            .with_max_pipeline_size(4096);
+        pool.set_receive_limits(limits);
+        assert_eq!(pool.receive_limits(), limits);
+        t.push_incoming(wire(3, &big));
+        let err = pool.next_message().await.unwrap_err();
+        assert!(matches!(err, PsrpError::Fragment(_)), "{err:?}");
+        assert!(!pool.transport_failing(), "the transport did deliver");
+
+        let t2 = MockTransport::new();
+        let mut pool = pool
+            .disconnect()
+            .await
+            .unwrap()
+            .reconnect(t2.clone())
+            .await
+            .unwrap();
+        assert_eq!(pool.receive_limits(), limits);
+        t2.push_incoming(wire(1, &big));
+        let err = pool.next_message().await.unwrap_err();
+        assert!(matches!(err, PsrpError::Fragment(_)), "{err:?}");
+        let _ = pool.close().await;
+    }
+
+    /// `transport_failing` tells a transport error from one the pool raised
+    /// on what it read, and follows the last call.
+    #[tokio::test]
+    async fn transport_failing_follows_the_last_transport_call() {
+        let t = MockTransport::new();
+        t.push_incoming(wire(1, &state_message_bytes(RunspacePoolState::Opened)));
+        let mut pool = RunspacePool::open_with_transport(t.clone()).await.unwrap();
+        assert!(!pool.transport_failing());
+
+        assert!(pool.next_message().await.is_err(), "mock inbox empty");
+        assert!(pool.transport_failing());
+
+        t.push_incoming(wire(2, &state_message_bytes(RunspacePoolState::Opened)));
+        pool.next_message().await.unwrap();
+        assert!(!pool.transport_failing());
+
+        *t.fail_send.lock().unwrap() = true;
+        let pid = Uuid::new_v4();
+        assert!(
+            pool.send_pipeline_message(MessageType::PipelineInput, pid, String::new())
+                .await
+                .is_err()
+        );
+        assert!(pool.transport_failing());
+        assert!(
+            pool.send_psrp_message(MessageType::PublicKey, String::new())
+                .await
+                .is_err()
+        );
+        assert!(pool.transport_failing());
+        *t.fail_send.lock().unwrap() = false;
+        pool.send_psrp_message(MessageType::PublicKey, String::new())
+            .await
+            .unwrap();
+        assert!(!pool.transport_failing());
+        let _ = pool.close().await;
+    }
+
+    /// Regression: every `PublicKeyRequest` that found no exchange in flight
+    /// made the pool generate an RSA-2048 key pair, as often as the server
+    /// asked. The pool now refuses after [`MAX_POOL_KEY_EXCHANGES`].
+    #[tokio::test]
+    async fn the_server_cannot_ask_for_key_pairs_without_end() {
+        let request = || {
+            wire(
+                4,
+                &PsrpMessage {
+                    destination: Destination::Client,
+                    message_type: MessageType::PublicKeyRequest,
+                    rpid: Uuid::nil(),
+                    pid: Uuid::nil(),
+                    data: to_clixml(&PsValue::Object(PsObject::new())),
+                }
+                .encode(),
+            )
+        };
+        let public_keys = |t: &MockTransport| {
+            sent_messages(t)
+                .iter()
+                .filter(|m| m.message_type == MessageType::PublicKey)
+                .count()
+        };
+        assert_eq!(MAX_POOL_KEY_EXCHANGES, 8);
+
+        let t = MockTransport::new();
+        let mut pool = opened_pool_with_host(&t, Arc::new(SecretHost)).await;
+        assert_eq!(pool.pool_key_exchanges, 0);
+        // The last one allowed.
+        pool.pool_key_exchanges = MAX_POOL_KEY_EXCHANGES - 1;
+        t.push_incoming(request());
+        pool.next_message().await.unwrap();
+        assert_eq!(pool.pool_key_exchanges, MAX_POOL_KEY_EXCHANGES);
+        assert_eq!(public_keys(&t), 1);
+
+        // That exchange over, the next request is refused, and no key pair
+        // is generated for it.
+        pool.pending_client_key = None;
+        t.push_incoming(request());
+        let err = pool.next_message().await.unwrap_err();
+        assert!(matches!(err, PsrpError::Protocol(_)), "{err:?}");
+        assert!(err.to_string().contains("8 session-key exchanges"), "{err}");
+        assert_eq!(public_keys(&t), 1);
+        assert!(pool.pending_client_key.is_none());
+        assert_eq!(pool.pool_key_exchanges, MAX_POOL_KEY_EXCHANGES);
+        let _ = pool.close().await;
+    }
+
+    /// Outside a Tokio runtime there is no blocking pool: the key pair is
+    /// generated in place, so the future is ready at its first poll.
+    #[test]
+    fn a_key_pair_is_generated_without_a_tokio_runtime() {
+        let mut generating = std::pin::pin!(generate_client_key());
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let std::task::Poll::Ready(key) = generating.as_mut().poll(&mut cx) else {
+            panic!("generation should not wait for anything without a runtime");
+        };
+        assert_ne!(key.unwrap().public_blob().len(), 0);
+    }
+
+    #[test]
+    fn wipe_secure_strings_empties_every_secret_and_nothing_else() {
+        let secret = || PsValue::SecureString("hunter2".into());
+        let mut value = PsValue::List(vec![
+            secret(),
+            PsValue::String("kept".into()),
+            PsValue::Dict(vec![(secret(), secret())]),
+            PsValue::Object(
+                PsObject::new()
+                    .with("Password", secret())
+                    .with("UserName", PsValue::String("alice".into()))
+                    .with("Nested", PsValue::List(vec![secret()])),
+            ),
+        ]);
+        wipe_secure_strings(&mut value);
+        let wiped = || PsValue::SecureString(String::new());
+        assert_eq!(
+            value,
+            PsValue::List(vec![
+                wiped(),
+                PsValue::String("kept".into()),
+                PsValue::Dict(vec![(wiped(), wiped())]),
+                PsValue::Object(
+                    PsObject::new()
+                        .with("Password", wiped())
+                        .with("UserName", PsValue::String("alice".into()))
+                        .with("Nested", PsValue::List(vec![wiped()])),
+                ),
+            ])
+        );
+        assert!(!contains_secure_string(&PsValue::I32(1)));
+    }
+
+    /// Encrypting an object keeps its type names, its `ToString` and the
+    /// order of its properties.
+    #[test]
+    fn encrypting_an_object_keeps_everything_but_the_plaintext() {
+        let key = crate::crypto::SessionKey::from_bytes([5u8; 32]);
+        let mut obj = PsObject::new()
+            .with("UserName", PsValue::String("alice".into()))
+            .with("Password", PsValue::SecureString("hunter2".into()))
+            .with_type_names(["System.Management.Automation.PSCredential"]);
+        obj.to_string = Some("shown".into());
+        let PsValue::Object(out) = encrypt_secure_strings(&PsValue::Object(obj.clone()), &key)
+        else {
+            panic!("an object stays an object");
+        };
+        assert_eq!(out.type_names, obj.type_names);
+        assert_eq!(out.to_string, obj.to_string);
+        assert_eq!(
+            out.properties.keys().collect::<Vec<_>>(),
+            vec!["UserName", "Password"]
+        );
+        assert_eq!(out.get("UserName"), obj.get("UserName"));
+        let Some(PsValue::SecureString(sealed)) = out.get("Password") else {
+            panic!("the password stays a SecureString");
+        };
+        let sealed = crate::clixml::encode::base64_decode(sealed).unwrap();
+        assert_eq!(key.decrypt_secure_string(&sealed).unwrap(), "hunter2");
     }
 }

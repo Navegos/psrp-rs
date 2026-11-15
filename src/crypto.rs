@@ -41,7 +41,7 @@ use aes::cipher::{BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
 use rand::RngCore;
 use rsa::traits::PublicKeyParts;
 use rsa::{Pkcs1v15Encrypt, RsaPrivateKey, RsaPublicKey};
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::error::{PsrpError, Result};
 
@@ -254,11 +254,15 @@ impl SessionKey {
     /// ciphertext is noticed only when it breaks the padding or the
     /// UTF-16, otherwise it decrypts to different text.
     pub fn encrypt_secure_string(&self, plaintext: &str) -> Vec<u8> {
-        // UTF-16LE encode + PKCS#7 pad to 16 bytes.
-        let mut padded: Vec<u8> = plaintext
-            .encode_utf16()
-            .flat_map(u16::to_le_bytes)
-            .collect();
+        // UTF-16LE encode + PKCS#7 pad to 16 bytes. This buffer is the
+        // plaintext: it is wiped when dropped, and sized up front (UTF-16
+        // has at most as many code units as UTF-8 has bytes, and the padding
+        // is at most a block) so that it never moves and leaves a copy
+        // behind.
+        let mut padded: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::with_capacity(
+            plaintext.len().saturating_mul(2).saturating_add(16),
+        ));
+        padded.extend(plaintext.encode_utf16().flat_map(u16::to_le_bytes));
         // `len % 16` is below 16, so it fits a `u8` and `pad` is 1..=16.
         let rem = u8::try_from(padded.len() % 16).unwrap_or_default();
         let pad = 16u8.saturating_sub(rem);
@@ -276,6 +280,8 @@ impl SessionKey {
                 *b ^= *p;
             }
             let mut ga = Array::from(block);
+            // The plaintext block, XORed with bytes that are on the wire.
+            block.zeroize();
             cipher.encrypt_block(&mut ga);
             prev.copy_from_slice(ga.as_ref());
             out.extend_from_slice(&prev);
@@ -303,15 +309,19 @@ impl SessionKey {
         let cipher = Aes256::new(&Array::from(self.key));
 
         let mut prev: [u8; 16] = SECURE_STRING_IV;
-        let mut pt = Vec::with_capacity(payload.len());
+        // The plaintext, as bytes here and as UTF-16 below: both buffers are
+        // wiped when dropped (the `String` returned is the caller's).
+        let mut pt = Zeroizing::new(Vec::with_capacity(payload.len()));
         for chunk in payload.as_chunks::<16>().0 {
-            let mut ga = Array::from(*chunk);
-            cipher.decrypt_block(&mut ga);
-            let mut block: [u8; 16] = ga.into();
+            // Decrypted in place: the block is the only copy of the
+            // plaintext outside `pt`, and is wiped below.
+            let mut block: [u8; 16] = *chunk;
+            cipher.decrypt_block((&mut block).into());
             for (b, p) in block.iter_mut().zip(&prev) {
                 *b ^= *p;
             }
             pt.extend_from_slice(&block);
+            block.zeroize();
             prev.copy_from_slice(chunk);
         }
 
@@ -336,12 +346,13 @@ impl SessionKey {
                 "secure string plaintext not UTF-16 aligned",
             ));
         }
-        let units: Vec<u16> = pt
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|c| u16::from_le_bytes(*c))
-            .collect();
+        let units: Zeroizing<Vec<u16>> = Zeroizing::new(
+            pt.as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| u16::from_le_bytes(*c))
+                .collect(),
+        );
         String::from_utf16(&units)
             .map_err(|e| PsrpError::protocol(format!("secure string UTF-16: {e}")))
     }
